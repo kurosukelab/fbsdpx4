@@ -1,4 +1,4 @@
-CC := gcc
+CC := cc
 CFLAGS := -O2 -Wall
 
 TARGET := fwtool
