@@ -2,6 +2,21 @@
 
 // Toshiba TC90522 driver
 
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/bus.h>
+#include <sys/mutex.h>
+#include <sys/condvar.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdi_util.h>
+#include <dev/usb/usbhid.h>
+#include <dev/usb/usb_core.h>
+#include "usbdevs.h"
+
+#include "px4_misc.h"
+
+#else
 #include "print_format.h"
 
 #include <linux/types.h>
@@ -10,6 +25,7 @@
 #include <linux/string.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#endif
 
 #include "i2c_comm.h"
 #include "tc90522.h"

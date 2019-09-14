@@ -3,9 +3,13 @@
 #ifndef __R850_H__
 #define __R850_H__
 
+#if defined(__FreeBSD__)
+#include "px4_misc.h"
+#else
 #include <linux/types.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#endif
 
 #include "i2c_comm.h"
 
@@ -52,7 +56,11 @@ struct r850_imr {
 };
 
 struct r850_priv {
+#if defined(__FreeBSD__)
+  struct mtx lock;
+#else
 	struct mutex lock;
+#endif
 	bool init;
 	int chip;
 	u8 xtal_pwr;

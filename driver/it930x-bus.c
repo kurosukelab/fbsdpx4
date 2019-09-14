@@ -1,7 +1,21 @@
 // it930x-bus.c
 
 // IT930x bus functions
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/bus.h>
+#include <sys/mutex.h>
+#include <sys/condvar.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdi_util.h>
+#include <dev/usb/usbhid.h>
+#include <dev/usb/usb_core.h>
+#include "usbdevs.h"
 
+#include "px4_misc.h"
+
+#else
 #include "print_format.h"
 
 #include <linux/version.h>
@@ -11,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/usb.h>
+#endif
 
 #include "it930x-config.h"
 #include "it930x-bus.h"
@@ -38,10 +53,208 @@ struct it930x_usb_context {
 	atomic_t start;
 };
 
+#if defined(__FreeBSD__)
+#define IT930X_BUF_SIZE (256)
+
+static const struct usb_config it930x_config[ IT930X_N_TRANSFER] = {
+	[IT930X_BULK_WR] = {
+		.callback = &it930x_usb_bulk_tx_msg_callback,
+		.bufsize = IT930X_BUF_SIZE,
+		.flags = {.pipe_bof = 1},
+		.type = UE_BULK,
+		.endpoint = 0x02,
+		.direction = UE_DIR_OUT
+	},
+	[IT930X_BULK_RD] = {
+		.callback = &it930x_usb_bulk_rx_msg_callback,
+		.bufsize = IT930X_BUF_SIZE,
+		.flags = { .short_xfer_ok = 1, .pipe_bof = 1},
+		.type = UE_BULK,
+		.endpoint = 0x81,
+		.direction = UE_DIR_IN
+	},
+	[IT930X_BULK_STREAM_RD] = {
+		.callback = &it930x_usb_stream_callback,
+		.bufsize = 188*816,
+		.flags = { .short_xfer_ok = 1, .pipe_bof = 1, .proxy_buffer = 1 },
+		.timeout = 1000, /* 1 second. */
+		.type = UE_BULK,
+		.endpoint = 0x84,
+		.direction = UE_DIR_IN
+	}
+};
+
+void it930x_usb_bulk_tx_msg_callback( struct usb_xfer *transfer, usb_error_t error )
+{
+	struct it930x_bus *bus = usbd_xfer_softc( transfer );
+	
+	switch (USB_GET_STATE(transfer)) {
+	case USB_ST_SETUP:
+		
+		usbd_transfer_submit(transfer);
+		break;
+	default:
+		cv_signal(&bus->usb.tx_cv);
+		break;
+	}
+}
+
+void it930x_usb_bulk_rx_msg_callback( struct usb_xfer *transfer, usb_error_t error )
+{
+	struct it930x_bus *bus = usbd_xfer_softc( transfer );
+	int actual;
+	int max;
+	
+	usbd_xfer_status( transfer, &actual, NULL, NULL, NULL );
+	
+	switch (USB_GET_STATE(transfer)) {
+	case USB_ST_TRANSFERRED:
+		if(actual != 0){
+			cv_signal(&bus->usb.rx_cv);
+		}
+		break;
+	case USB_ST_SETUP:
+		max = usbd_xfer_max_len( transfer );
+		usbd_xfer_set_frame_len( transfer, 0, max );
+		usbd_transfer_submit(transfer);
+		
+		break;
+	default:
+		if( error != USB_ERR_CANCELLED ){
+			usbd_xfer_set_stall( transfer );
+			dev_dbg(bus->dev, "rx error=%d\n", error);
+		}
+		cv_signal(&bus->usb.rx_cv);
+		break;
+	}
+}
+
+void it930x_usb_stream_callback(struct usb_xfer *transfer, usb_error_t error)
+{
+	struct it930x_bus *bus = usbd_xfer_softc( transfer );
+	struct it930x_usb_context *ctx = bus->usb.priv;
+	void *context = ctx->ctx;
+	struct usb_page_cache *pc;
+	int actual;
+	int max;
+	
+	usbd_xfer_status( transfer, &actual, NULL, NULL, NULL );
+	
+	switch (USB_GET_STATE(transfer)) {
+	case USB_ST_TRANSFERRED:
+		if( actual == 0 ){
+			bus->usb.zero_length_packets++;
+			usbd_xfer_set_interval(transfer, 30);
+		}
+		else {
+			if(bus->usb.zero_length_packets){
+				dev_dbg(bus->dev, "zero length packets=%d\n", bus->usb.zero_length_packets);
+			}
+			usbd_xfer_set_interval(transfer, 0);
+			bus->usb.zero_length_packets = 0;
+			pc = usbd_xfer_get_frame( transfer, 0 );
+			ctx->on_stream(context, pc );
+		}
+	case USB_ST_SETUP:
+	setup:
+		if(bus->usb.fifos_put_bytes_max != NULL){
+			if((*bus->usb.fifos_put_bytes_max)(context)){
+				max = usbd_xfer_max_len( transfer );
+				usbd_xfer_set_frame_len( transfer, 0, max );
+				usbd_transfer_submit(transfer);
+			}
+		}
+		
+		break;
+	default:
+		usbd_xfer_set_interval(transfer, 0);
+		bus->usb.zero_length_packets = 0;
+		
+		if( error != USB_ERR_CANCELLED ){
+			usbd_xfer_set_stall( transfer );
+			goto setup;
+		}
+		break;
+	}
+
+}
+
+static int it930x_usb_bulk_tx_msg(struct it930x_bus *bus, const void *buf, int len, int *act_len, int timeout )
+{
+	struct usb_xfer *xfer;
+	struct usb_page_cache *pc;
+	int max;
+	int ret;
+	
+	xfer= bus->usb.transfer[ IT930X_BULK_WR ];
+	
+	usbd_xfer_set_timeout(xfer, timeout );
+	max = usbd_xfer_max_len( xfer);
+	pc = usbd_xfer_get_frame( xfer, 0);
+	
+	if ( len > max){
+		len = max;
+	}
+	usbd_copy_in( pc, 0, buf, len );
+	usbd_xfer_set_frame_len( xfer, 0 , len );
+	usbd_xfer_set_frames( xfer, 1 );
+	*act_len= len;
+	
+	usbd_transfer_start( xfer );
+	
+	mtx_lock( &bus->usb.xfer_tx_mtx );
+	cv_wait(&bus->usb.tx_cv, &bus->usb.xfer_tx_mtx);
+	mtx_unlock( &bus->usb.xfer_tx_mtx );
+	
+	ret= xfer->error;
+	
+	usbd_transfer_stop( xfer );
+	
+	return ret;
+  
+}
+
+static int it930x_usb_bulk_rx_msg(struct it930x_bus *bus, void *buf, int len, int *act_len, int timeout )
+{
+	struct usb_xfer *xfer;
+	struct usb_page_cache *pc;
+	int ret;
+  
+	xfer= bus->usb.transfer[ IT930X_BULK_RD ];
+	usbd_xfer_set_timeout(xfer, timeout );
+	
+	usbd_transfer_start( xfer );
+
+	mtx_lock( &bus->usb.xfer_rx_mtx );
+	cv_wait(&bus->usb.rx_cv, &bus->usb.xfer_rx_mtx);
+	mtx_unlock( &bus->usb.xfer_rx_mtx );
+	
+	ret= xfer->error;
+	
+	usbd_transfer_stop( xfer );
+
+	if( !ret ){
+		pc = usbd_xfer_get_frame( xfer, 0 );
+		*act_len = usbd_xfer_frame_len( xfer, 0 );
+		if(*act_len <= len ){
+			len= *act_len;
+		}
+		else {
+			dev_dbg(bus->dev,"actual length=%d, len=%d\n", *act_len, len);
+			*act_len= len;
+		}
+		usbd_copy_out( pc, 0, buf, len );
+	}    
+	return ret;
+}
+#endif
+
 static int it930x_usb_ctrl_tx(struct it930x_bus *bus, const void *buf, int len, void *opt)
 {
 	int ret = 0, rlen = 0;
+#ifndef __FreeBSD__	
 	struct usb_device *dev = bus->usb.dev;
+#endif
 #if 0
 	const u8 *p = buf;
 #endif
@@ -62,40 +275,52 @@ static int it930x_usb_ctrl_tx(struct it930x_bus *bus, const void *buf, int len, 
 	}
 #else
 	/* Endpoint 0x02: Control IN */
+#if defined(__FreeBSD__)
+	ret = it930x_usb_bulk_tx_msg(bus, buf, len, &rlen, bus->usb.ctrl_timeout );
+#else
 	ret = usb_bulk_msg(dev, usb_sndbulkpipe(dev, 0x02), (void *)buf, len, &rlen, bus->usb.ctrl_timeout);
+#endif
 #endif
 
 	if (ret)
 		dev_dbg(bus->dev, "it930x_usb_ctrl_tx: Failed. (ret: %d)\n", ret);
 
 	mdelay(1);
-
+	
 	return ret;
 }
 
 static int it930x_usb_ctrl_rx(struct it930x_bus *bus, void *buf, int *len, void *opt)
 {
 	int ret = 0, rlen = 0;
+#ifndef __FreeBSD__
 	struct usb_device *dev = bus->usb.dev;
-
+#endif
+	
 	if (!buf || !len || !*len)
 		return -EINVAL;
 
 	/* Endpoint 0x81: Control OUT */
+#if defined(__FreeBSD__)
+	ret = it930x_usb_bulk_rx_msg(bus, buf, *len, &rlen, bus->usb.ctrl_timeout );
+#else
 	ret = usb_bulk_msg(dev, usb_rcvbulkpipe(dev, 0x81), buf, *len, &rlen, bus->usb.ctrl_timeout);
+#endif
 	if (ret)
 		dev_dbg(bus->dev, "it930x_usb_ctrl_rx: Failed. (ret: %d)\n", ret);
 
 	*len = rlen;
 
 	mdelay(1);
-
+	
 	return ret;
 }
 
 static int it930x_usb_stream_rx(struct it930x_bus *bus, void *buf, int *len, int timeout)
 {
-	int ret = 0, rlen = 0;
+	int ret = 0;
+#if !defined(__FreeBSD__)
+	int rlen = 0;
 	struct usb_device *dev = bus->usb.dev;
 
 	if (!buf | !len || !*len)
@@ -107,12 +332,15 @@ static int it930x_usb_stream_rx(struct it930x_bus *bus, void *buf, int *len, int
 		dev_dbg(bus->dev, "it930x_usb_stream_rx: Failed. (ret: %d)\n", ret);
 
 	*len = rlen;
+#endif
 
 	return ret;
 }
 
+#if !defined(__FreeBSD__)
 static void free_urb_buffers(struct usb_device *dev, struct it930x_usb_work *works, u32 n, bool free_urb, bool no_dma)
 {
+
 	u32 i;
 
 	if (!works)
@@ -146,6 +374,7 @@ static void free_urb_buffers(struct usb_device *dev, struct it930x_usb_work *wor
 
 	return;
 }
+#endif
 
 #ifdef IT930X_BUS_USE_WORKQUEUE
 static void it930x_usb_workqueue_handler(struct work_struct *work)
@@ -160,8 +389,10 @@ static void it930x_usb_workqueue_handler(struct work_struct *work)
 }
 #endif
 
+#if !defined(__FreeBSD__)
 static void it930x_usb_complete(struct urb *urb)
 {
+
 	int ret = 0;
 	struct it930x_usb_work *w = urb->context;
 	struct it930x_usb_context *ctx = w->ctx;
@@ -187,18 +418,24 @@ static void it930x_usb_complete(struct urb *urb)
 			dev_dbg(ctx->bus->dev, "it930x_usb_complete: usb_submit_urb() failed. (ret: %d)\n", ret);
 #endif
 	}
-
+	
 	return;
 }
+#endif
 
 static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stream_t on_stream, void *context)
 {
 	int ret = 0;
+
+#if !defined(__FreeBSD__)
 	u32 i, l, n;
 	bool no_dma;
 	struct usb_device *dev = bus->usb.dev;
+#endif
 	struct it930x_usb_context *ctx = bus->usb.priv;
+#if !defined(__FreeBSD__)
 	struct it930x_usb_work *works;
+#endif
 
 	if (!on_stream)
 		return -EINVAL;
@@ -210,13 +447,16 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 		return 0;
 	}
 
+#if !defined(__FreeBSD__)
 	l = bus->usb.streaming_urb_buffer_size;
 	n = bus->usb.streaming_urb_num;
 	no_dma = bus->usb.streaming_no_dma;
-
+#endif
+	
 	ctx->on_stream = on_stream;
 	ctx->ctx = context;
 
+#if !defined(__FreeBSD__)
 	works = kcalloc(n, sizeof(*works), GFP_ATOMIC);
 	if (!works) {
 		ret = -ENOMEM;
@@ -282,8 +522,13 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 		goto fail;
 #endif
 
-	usb_reset_endpoint(dev, 0x84);
+#endif
 
+#if defined(__FreeBSD__)
+	usbd_xfer_set_stall(bus->usb.transfer[ IT930X_BULK_STREAM_RD ]);
+#else
+	usb_reset_endpoint(dev, 0x84);
+	
 	for (i = 0; i < n; i++) {
 		ret = usb_submit_urb(works[i].urb, GFP_ATOMIC);
 		if (ret) {
@@ -300,17 +545,21 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 
 	if (ret)
 		goto fail;
+#endif
 
+#if !defined(__FreeBSD__)	
 	dev_dbg(bus->dev, "it930x_usb_start_streaming: n: %u\n", n);
 
 	ctx->num_urb = n;
 	ctx->no_dma = no_dma;
 	ctx->works = works;
-
+#endif
+	
 	atomic_sub(1, &ctx->start);
 
 	return ret;
 
+#if !defined(__FreeBSD__)	
 fail:
 #ifdef IT930X_BUS_USE_WORKQUEUE
 	if (ctx->wq) {
@@ -323,7 +572,7 @@ fail:
 
 	if (works)
 		kfree(works);
-
+	
 	ctx->on_stream = NULL;
 	ctx->ctx = NULL;
 	ctx->num_urb = 0;
@@ -336,15 +585,20 @@ fail:
 	atomic_sub(2, &ctx->start);
 
 	return ret;
+#endif
 }
 
 static int it930x_usb_stop_streaming(struct it930x_bus *bus)
 {
+#if !defined(__FreeBSD__)
 	u32 i, n;
 	struct usb_device *dev = bus->usb.dev;
+#endif	
 	struct it930x_usb_context *ctx = bus->usb.priv;
+#if !defined(__FreeBSD__)
 	struct it930x_usb_work *works = ctx->works;
-
+#endif
+	
 	dev_dbg(bus->dev, "it930x_usb_stop_streaming\n");
 
 	if (atomic_sub_return(2, &ctx->start) != -1) {
@@ -352,6 +606,7 @@ static int it930x_usb_stop_streaming(struct it930x_bus *bus)
 		return 0;
 	}
 
+#if !defined(__FreeBSD__)
 	n = ctx->num_urb;
 
 #ifdef IT930X_BUS_USE_WORKQUEUE
@@ -368,16 +623,19 @@ static int it930x_usb_stop_streaming(struct it930x_bus *bus)
 		free_urb_buffers(dev, works, n, true, ctx->no_dma);
 		kfree(works);
 	}
-
+#endif
+	
 	ctx->on_stream = NULL;
 	ctx->ctx = NULL;
+#if !defined(__FreeBSD__)
 	ctx->num_urb = 0;
 	ctx->no_dma = false;
 #ifdef IT930X_BUS_USE_WORKQUEUE
 	ctx->wq = NULL;
 #endif
 	ctx->works = NULL;
-
+#endif
+	
 	atomic_add(1, &ctx->start);
 
 	return 0;
@@ -403,8 +661,10 @@ int it930x_bus_init(struct it930x_bus *bus)
 				break;
 			}
 
+#if !defined(__FreeBSD__)
 			usb_get_dev(bus->usb.dev);
-
+#endif
+			
 			ctx->bus = bus;
 			ctx->on_stream = NULL;
 			ctx->ctx = NULL;
@@ -423,6 +683,27 @@ int it930x_bus_init(struct it930x_bus *bus)
 			bus->ops.stream_rx = it930x_usb_stream_rx;
 			bus->ops.start_streaming = it930x_usb_start_streaming;
 			bus->ops.stop_streaming = it930x_usb_stop_streaming;
+
+#if defined(__FreeBSD__)
+			{
+				int error;
+				
+				cv_init( &bus->usb.tx_cv, "it930x-bus");
+				mtx_init( &bus->usb.xfer_tx_mtx, "it930x-bus", NULL, MTX_DEF);
+				cv_init( &bus->usb.rx_cv, "it930x-bus");
+				mtx_init( &bus->usb.xfer_rx_mtx, "it930x-bus", NULL, MTX_DEF);
+
+				error = usbd_transfer_setup( bus->usb.dev, &bus->usb.iface_index,
+											 bus->usb.transfer, it930x_config, IT930X_N_TRANSFER, bus,
+											 bus->usb.plock );
+				
+				if (error) {
+					ret = -ENOMEM;
+					break;
+				}
+			}
+#endif
+
 		}
 		break;
 
@@ -452,9 +733,19 @@ int it930x_bus_term(struct it930x_bus *bus)
 			it930x_usb_stop_streaming(bus);
 			kfree(ctx);
 		}
+#if defined(__FreeBSD__)
+		if (bus->usb.dev){
+			usbd_transfer_unsetup( bus->usb.transfer, IT930X_N_TRANSFER );
+			cv_destroy( &bus->usb.tx_cv );
+			mtx_destroy( &bus->usb.xfer_tx_mtx );
+			cv_destroy( &bus->usb.rx_cv );
+			mtx_destroy( &bus->usb.xfer_rx_mtx );
+		}
+#else  
 		if (bus->usb.dev)
 			usb_put_dev(bus->usb.dev);
-
+#endif
+		
 		break;
 	}
 

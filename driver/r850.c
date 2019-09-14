@@ -3,7 +3,21 @@
 // RafaelMicro R850 driver
 
 // Some features are not implemented.
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/bus.h>
+#include <sys/mutex.h>
+#include <sys/condvar.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdi_util.h>
+#include <dev/usb/usbhid.h>
+#include <dev/usb/usb_core.h>
+#include "usbdevs.h"
 
+#include "px4_misc.h"
+
+#else
 #include "print_format.h"
 
 #include <linux/types.h>
@@ -13,6 +27,7 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#endif
 
 #include "r850.h"
 
@@ -817,14 +832,26 @@ static int _r850_set_pll(struct r850_tuner *t, u32 lo_freq, u32 if_freq, enum r8
 
 	switch (xtal_div) {
 	case 0:
+#if defined(__FreeBSD__)
+		pause( NULL, MSEC_2_TICKS( 10 ));
+#else
 		msleep(10);
+#endif
 		break;
 	case 1:
 	case 2:
+#if defined(__FreeBSD__)
+		pause( NULL, MSEC_2_TICKS( 20 ));
+#else
 		msleep(20);
+#endif
 		break;
 	default:
+#if defined(__FreeBSD__)
+		pause( NULL, MSEC_2_TICKS( 40 ));
+#else
 		msleep(40);
+#endif
 		break;
 	}
 

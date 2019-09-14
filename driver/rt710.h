@@ -3,9 +3,13 @@
 #ifndef __RT710_H__
 #define __RT710_H__
 
+#if defined(__FreeBSD__)
+#include "px4_misc.h"
+#else
 #include <linux/types.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#endif
 
 #include "i2c_comm.h"
 
@@ -34,7 +38,11 @@ struct rt710_config {
 };
 
 struct rt710_priv {
+#if defined(__FreeBSD__)
+  struct mtx lock;
+#else
 	struct mutex lock;
+#endif
 	bool init;
 	u32 freq;
 };

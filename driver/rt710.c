@@ -2,6 +2,21 @@
 
 // RafaelMicro RT710 driver
 
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/bus.h>
+#include <sys/mutex.h>
+#include <sys/condvar.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdi_util.h>
+#include <dev/usb/usbhid.h>
+#include <dev/usb/usb_core.h>
+#include "usbdevs.h"
+
+#include "px4_misc.h"
+
+#else
 #include "print_format.h"
 
 #include <linux/types.h>
@@ -11,6 +26,7 @@
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#endif
 
 #include "i2c_comm.h"
 #include "rt710.h"
@@ -359,7 +375,11 @@ int rt710_set_params(struct rt710_tuner *t, u32 freq, u32 symbol_rate, u32 rollo
 		goto fail;
 	}
 
+#if defined(__FreeBSD__)
+	pause( NULL, MSEC_2_TICKS( 10 ));
+#else
 	msleep(10);
+#endif
 
 	if ((freq - 1600000) >= 350000) {
 		regs[0x02] &= 0xbf;

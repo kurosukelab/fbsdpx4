@@ -3,9 +3,11 @@
 #ifndef __IT930X_H__
 #define __IT930X_H__
 
+#if !defined(__FreeBSD__)
 #include <linux/types.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#endif
 
 #include "it930x-config.h"
 #include "it930x-bus.h"
@@ -54,7 +56,11 @@ struct it930x_gpio_state {
 
 struct it930x_priv {
 	struct it930x_i2c_master_info i2c[2];
+#if defined(__FreeBSD__)
+  struct mtx lock;
+#else
 	struct mutex lock;
+#endif
 	u8 *buf;
 	u8 sequence;
 	struct it930x_gpio_state status[16];

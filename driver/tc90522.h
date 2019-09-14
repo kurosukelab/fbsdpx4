@@ -3,14 +3,22 @@
 #ifndef __TC90522_H__
 #define __TC90522_H__
 
+#if defined(__FreeBSD__)
+#include "px4_misc.h"
+#else
 #include <linux/types.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#endif
 
 #include "i2c_comm.h"
 
 struct tc90522_priv {
+#if defined(__FreeBSD__)
+  struct mtx lock;
+#else
 	struct mutex lock;
+#endif  
 };
 
 struct tc90522_demod {

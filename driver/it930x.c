@@ -1,7 +1,23 @@
 // it930x.c
 
 // ITE IT930x driver
+#if defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/bus.h>
+#include <sys/mutex.h>
+#include <sys/condvar.h>
+#include <sys/errno.h>
+#include <sys/firmware.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdi_util.h>
+#include <dev/usb/usbhid.h>
+#include <dev/usb/usb_core.h>
+#include "usbdevs.h"
 
+#include "px4_misc.h"
+
+#else
 #include "print_format.h"
 
 #include <linux/types.h>
@@ -11,6 +27,7 @@
 #include <linux/mutex.h>
 #include <linux/device.h>
 #include <linux/firmware.h>
+#endif
 
 #include "it930x-config.h"
 #include "it930x-bus.h"
@@ -731,17 +748,33 @@ int it930x_load_firmware(struct it930x_bridge *it930x, const char *filename)
 		goto exit;
 	}
 
+#if defined(__FreeBSD__)
+	fw = firmware_get(filename);
+	if( fw == NULL){
+		ret = -ENOENT;
+		dev_err(it930x->dev, "it930x_load_firmware: request_firmware() failed. (ret: %d)\n", ret);
+		dev_err(it930x->dev, "Couldn't load firmware from the file.\n");
+		goto exit;
+	}
+
+	n= fw->datasize;
+#else	
 	ret = request_firmware(&fw, filename, it930x->dev);
 	if (ret) {
 		dev_err(it930x->dev, "it930x_load_firmware: request_firmware() failed. (ret: %d)\n", ret);
 		dev_err(it930x->dev, "Couldn't load firmware from the file.\n");
 		goto exit;
 	}
-
+	
 	n = fw->size;
+#endif
 
 	for(i = 0; i < n; i += len) {
+#if defined(__FreeBSD__)
+		const u8 *p = &(((const u8 *)fw->data)[i]);
+#else
 		const u8 *p = &fw->data[i];
+#endif
 		unsigned j, m = p[3];
 
 		len = 0;
@@ -797,8 +830,12 @@ int it930x_load_firmware(struct it930x_bridge *it930x, const char *filename)
 	dev_info(it930x->dev, "Firmware loaded. version: %d.%d.%d.%d\n", ((fw_version >> 24) & 0xff), ((fw_version >> 16) & 0xff), ((fw_version >> 8) & 0xff), (fw_version & 0xff));
 
 exit_fw:
+#if defined(__FreeBSD__)
+	firmware_put(fw, FIRMWARE_UNLOAD);
+#else
 	release_firmware(fw);
-
+#endif
+	
 exit:
 	mutex_unlock(&it930x->priv.lock);
 
