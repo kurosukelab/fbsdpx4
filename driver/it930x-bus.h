@@ -53,12 +53,15 @@ struct it930x_bus {
 		struct {
 			struct usb_device *dev;
 			int ctrl_timeout;
+#if !defined(__FreeBSD__)
 			u32 streaming_urb_buffer_size;
+#endif
 			u32 streaming_urb_num;
 			bool streaming_no_dma;
 			void *priv;
 #if defined(__FreeBSD__)
-		  	uint8_t iface_num;
+			u32 streaming_usb_buffer_size;
+			uint8_t iface_num;
 			uint8_t iface_index;
 			struct mtx* plock;
 			struct usb_xfer *transfer[IT930X_N_TRANSFER];

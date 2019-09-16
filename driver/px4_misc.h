@@ -15,7 +15,6 @@
 #endif
 
 
-//#define kcalloc(A)malloc(A,M_DEVBUF,M_NOWAIT)
 #define kzalloc(A,B) malloc(A,M_DEVBUF,M_NOWAIT)
 #define kmalloc(A,B) malloc(A,M_DEVBUF,M_NOWAIT)
 #define vfree(A) free(A,M_DEVBUF)
@@ -25,22 +24,18 @@
       (type *)( (char *)__mptr - offsetof(type,member) );})
 
 #ifdef DEBUG
-#define dev_dbg(dev,fmt,...) device_printf(dev,"DEBUG:%s: " fmt,		\
-					   __FUNCTION__ ,##__VA_ARGS__)
-#define pr_debug(fmt,...) printf("%s: " fmt,__FUNCTION__ ,##__VA_ARGS__)
+#define dev_dbg(dev,fmt,...) device_printf(dev,"DEBUG:" fmt, ##__VA_ARGS__)
+#define pr_debug(fmt,...) printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__)
 #else
 #define dev_dbg(dev,fmt,...)
 #define pr_debug(fmt,...)
 #endif
 
-#define dev_err(dev,fmt,...)  device_printf(dev,"ERROR:%s: " fmt,		\
-					   __FUNCTION__ ,##__VA_ARGS__)
+#define dev_err(dev,fmt,...)  device_printf(dev,"ERROR:" fmt, ##__VA_ARGS__)
 
-#define dev_warn(dev,fmt,...)  device_printf(dev,"WARNING:%s: " fmt,		\
-					   __FUNCTION__ ,##__VA_ARGS__)
-#define dev_info(dev,fmt,...)  device_printf(dev,"INFO:%s: " fmt,		\
-					   __FUNCTION__ ,##__VA_ARGS__)
-#define pr_err(fmt,...) printf("%s: " fmt,__FUNCTION__,##__VA_ARGS__)
+#define dev_warn(dev,fmt,...)  device_printf(dev,"WARNING:" fmt, ##__VA_ARGS__)
+#define dev_info(dev,fmt,...)  device_printf(dev,"INFO:" fmt, ##__VA_ARGS__)
+#define pr_err(fmt,...) printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__)
 
 
 #define mutex_init(A)		mtx_init(A, "px4", NULL, MTX_DEF)

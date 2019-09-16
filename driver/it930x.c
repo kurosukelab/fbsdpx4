@@ -211,7 +211,7 @@ int it930x_write_reg(struct it930x_bridge *it930x, u32 reg, u8 val)
 	ret = _it930x_write_regs(it930x, reg, &val, 1);
 
 	mutex_unlock(&it930x->priv.lock);
-
+	
 	return ret;
 }
 

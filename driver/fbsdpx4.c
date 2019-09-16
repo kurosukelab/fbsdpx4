@@ -68,15 +68,10 @@
 #define TS_SYNC_COUNT	4
 #define TS_SYNC_SIZE	(188 * TS_SYNC_COUNT)
 
-
-#define PX4_BUF_SIZE (256)
-#define PX4_IFQ_MAX_LEN 2048
 #define PX4_MAX_DEV 4
-
 
 struct px4_tsdev {
 	struct px4_softc *parent;
-	uint8_t subunit;
 	struct mtx lock;
 	unsigned int id;
 	int isdb;				// ISDB_T or ISDB_S
@@ -90,7 +85,7 @@ struct px4_tsdev {
 	} t;
 	atomic_t streaming;			// 0: not streaming, !0: streaming
 	struct usb_fifo *sc_fifo_open;
-	int sc_fflags;
+	int freq;
 };
 
 struct px4_stream_context {
@@ -108,7 +103,6 @@ struct px4_softc {
 	struct usb_callout sc_watchdog;
 	uint8_t sc_iface_num;
 	struct usb_fifo_sc sc_fifo[ TSDEV_NUM ];
-	//struct usb_fifo *sc_fifo_open[ TSDEV_NUM];
 	struct px4_tsdev tsdev[TSDEV_NUM];
 	uint8_t sc_previous_status;
 	int dev_idx;
@@ -116,7 +110,6 @@ struct px4_softc {
 	atomic_t avail;				// availability flag
 	struct cv wait_cv;
 	struct mtx wait_mtx;
-	//wait_queue_head_t wait;
 	unsigned long long serial_number;
 	unsigned int dev_id;			// 1 or 2
 	struct px4_multi_device *multi_dev;
@@ -145,29 +138,21 @@ static device_attach_t px4_attach;
 static device_detach_t px4_detach;
 static usb_fifo_open_t px4_tsdev_open;
 static usb_fifo_close_t px4_tsdev_release;
-static usb_fifo_ioctl_t px4_ioctl;
-//static usb_fifo_cmd_t px4_tsdev_start_read;
-//static usb_fifo_cmd_t px4_tsdev_stop_read;
+//static usb_fifo_ioctl_t px4_tsdev_ioctl;
+static usb_fifo_cmd_t px4_tsdev_start_read;
+static usb_fifo_cmd_t px4_tsdev_stop_read;
 
-//static usb_fifo_cmd_t px4_start_write;
-//static usb_fifo_cmd_t px4_stop_write;
-//static void px4_watchdog(void *);
-
-static int count = 0;
-
-
+static atomic_t gcount = 0;
 static struct mtx glock;
 //static DEFINE_MUTEX(glock);
 //static struct class *px4_class = NULL;
 //static dev_t px4_dev_first;
 static struct px4_softc *devs[ MAX_DEVICE ];
 static unsigned int xfer_packets = 816;
-//static unsigned int urb_max_packets = 816;
+static unsigned int usb_max_packets = 816;
 //static unsigned int max_urbs = 6;
-//static unsigned int tsdev_max_packets = 2048;
-//static int psb_purge_timeout = 2000;
-//static bool no_dma = false;
-static bool disable_multi_device_power_control = false;
+static unsigned int tsdev_max_packets = 2048;
+static bool disable_multi_device_power_control = true;
 static bool s_agc_negative_mode = false;
 static bool s_vga_atten = false;
 static unsigned int s_fine_gain = 3;
@@ -175,12 +160,95 @@ static unsigned int s_fine_gain = 3;
 static struct usb_fifo_methods px4_fifo_methods = {
 	.f_open = &px4_tsdev_open,
 	.f_close = &px4_tsdev_release,
-	.f_ioctl = &px4_ioctl,
-	//.f_start_read = &px4_tsdev_start_read,
-	//.f_stop_read = &px4_tsdev_stop_read,
+	//.f_ioctl = &px4_tsdev_ioctl,
+	.f_start_read = &px4_tsdev_start_read,
+	.f_stop_read = &px4_tsdev_stop_read,
 	.basename[0] = "px4video",
-	//.postfix[0] = "s"
+	.postfix[0] = "s"
 };
+
+//static int px4_sysctl_debug(SYSCTL_HANDLER_ARGS);
+static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS);
+static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS);
+static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS);
+
+
+static void px4_sysctl_init(void *p)
+{
+	struct px4_softc *px4;
+	device_t dev;
+	struct sysctl_ctx_list *scl;
+	struct sysctl_oid_list *sol;
+	struct sysctl_oid *soid;
+
+	px4 = p;
+	dev = px4->dev;
+
+	scl = device_get_sysctl_ctx( dev );
+	sol = SYSCTL_CHILDREN( device_get_sysctl_tree( dev ) );
+	
+	//SYSCTL_ADD_PROC(scl, sol,
+	//				OID_AUTO, "lnb", CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+	//				px4, 0, px4_sysctl_lnb, "I", "LNB");
+	
+	//	SYSCTL_ADD_PROC(scl, sol,
+	//				OID_AUTO, "px4debug", CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+	//				px4, 0, px4_sysctl_debug, "I", "PT4DEBUG");
+	
+	soid = SYSCTL_ADD_NODE(scl, sol,
+						   OID_AUTO, "0s", CTLFLAG_RD, 0, "tuner0(ISDB-S)");
+
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "lnb", CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					&px4->tsdev[0], 0, px4_sysctl_lnb, "I", "LNB");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "freq", CTLTYPE_INT|CTLFLAG_WR|CTLFLAG_ANYBODY,
+					&px4->tsdev[0], 0, px4_sysctl_freq, "I", "channel freq.");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "signal", CTLTYPE_INT|CTLFLAG_RD,
+					&px4->tsdev[0], 0, px4_sysctl_signal, "I", "signal strength");
+
+	soid = SYSCTL_ADD_NODE(scl, sol,
+						   OID_AUTO, "1s", CTLFLAG_RD, 0, "tuner1(ISDB-S)");
+
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "lnb", CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					&px4->tsdev[1], 0, px4_sysctl_lnb, "I", "LNB");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "freq", CTLTYPE_INT|CTLFLAG_WR|CTLFLAG_ANYBODY,
+					&px4->tsdev[1], 0, px4_sysctl_freq, "I", "channel freq.");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "signal", CTLTYPE_INT|CTLFLAG_RD,
+					&px4->tsdev[1], 0, px4_sysctl_signal, "I", "signal strength");
+
+	soid = SYSCTL_ADD_NODE(scl, sol,
+						   OID_AUTO, "2t", CTLFLAG_RD, 0, "tuner2(ISDB-T)");
+
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "lnb", CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					&px4->tsdev[2], 0, px4_sysctl_lnb, "I", "LNB");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "freq", CTLTYPE_INT|CTLFLAG_WR|CTLFLAG_ANYBODY,
+					&px4->tsdev[2], 0, px4_sysctl_freq, "I", "channel freq.");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "signal", CTLTYPE_INT|CTLFLAG_RD,
+					&px4->tsdev[2], 0, px4_sysctl_signal, "I", "signal strength");
+
+	soid = SYSCTL_ADD_NODE(scl, sol,
+						   OID_AUTO, "3t", CTLFLAG_RD, 0, "tuner3(ISDB-T)");
+
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "lnb", CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					&px4->tsdev[3], 0, px4_sysctl_lnb, "I", "LNB");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "freq", CTLTYPE_INT|CTLFLAG_WR|CTLFLAG_ANYBODY,
+					&px4->tsdev[3], 0, px4_sysctl_freq, "I", "channel freq.");
+	SYSCTL_ADD_PROC(scl, SYSCTL_CHILDREN(soid),
+					OID_AUTO, "signal", CTLTYPE_INT|CTLFLAG_RD,
+					&px4->tsdev[3], 0, px4_sysctl_signal, "I", "signal strength");
+
+	return;
+}
 
 static int px4_init(struct px4_softc *px4)
 {
@@ -342,16 +410,21 @@ static int px4_set_power(struct px4_softc *px4, bool on)
 
 			mutex_unlock(&multi_dev->lock);
 		} else {
+			dev_dbg(px4->dev, "px4_set_power: write_gpio 7\n" );
 			ret = it930x_write_gpio(it930x, 7, false);
 			if (ret)
 				goto exit;
 		}
-
+		dev_dbg(px4->dev, "px4_set_power: write_gpio 7 done.\n" );
+		
 		pause( NULL, MSEC_2_TICKS( 100 ));
 		
+		dev_dbg(px4->dev, "px4_set_power: write_gpio 2\n" );
 		ret = it930x_write_gpio(it930x, 2, true);
 		if (ret)
 			goto exit;
+
+		dev_dbg(px4->dev, "px4_set_power: write_gpio 2 done.\n" );
 
 		pause( NULL, MSEC_2_TICKS( 20 ));
 
@@ -674,12 +747,14 @@ static int px4_tsdev_init(struct px4_tsdev *tsdev)
 
 		break;
 	}
-
+	
 	default:
 		ret = -EIO;
 		break;
 	}
 
+	tsdev->freq= 0;
+	
 	if (!ret)
 		tsdev->init = true;
 
@@ -1058,12 +1133,19 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 	mutex_lock(&px4->lock);
 
 	if (!px4->streaming_count) {
-		//bus->usb.streaming_urb_buffer_size = 188 * urb_max_packets;
-		//bus->usb.streaming_urb_num = max_urbs;
-		//bus->usb.streaming_no_dma = no_dma;
+		
+#if defined(__FreeBSD__)
+		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: urb_buffer_size: %u, urb_num: %u, no_dma: %c\n", px4->dev_idx, tsdev->id, bus->usb.streaming_usb_buffer_size, bus->usb.streaming_urb_num, (bus->usb.streaming_no_dma) ? 'Y' : 'N');
+		
+		usbd_transfer_stop( bus->usb.transfer[ IT930X_BULK_STREAM_RD ] );
+		
+#else		
+		bus->usb.streaming_urb_buffer_size = 188 * urb_max_packets;
+		bus->usb.streaming_urb_num = max_urbs;
+		bus->usb.streaming_no_dma = no_dma;
 
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: urb_buffer_size: %u, urb_num: %u, no_dma: %c\n", px4->dev_idx, tsdev->id, bus->usb.streaming_urb_buffer_size, bus->usb.streaming_urb_num, (bus->usb.streaming_no_dma) ? 'Y' : 'N');
-#if !defined(__FreeBSD__)
+
 		ret = it930x_purge_psb(&px4->it930x, psb_purge_timeout);
 		if (ret) {
 			dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: it930x_purge_psb() failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
@@ -1155,6 +1237,19 @@ fail:
 	
 	return ret;
 }
+static void px4_tsdev_start_read( struct usb_fifo *fifo )
+{
+	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
+	struct px4_softc *px4 = tsdev->parent;
+	int error;
+
+	error = px4_tsdev_start_streaming( tsdev );
+	if(error){
+		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+	}
+	
+	return;
+}
 
 static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 {
@@ -1216,6 +1311,22 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 	
 	return ret;
 }
+static void px4_tsdev_stop_read( struct usb_fifo *fifo )
+{
+	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
+	struct px4_softc *px4 = tsdev->parent;
+	atomic_t avail;
+	int error;
+
+	atomic_read( &avail );
+
+	error = px4_tsdev_stop_streaming( tsdev, avail );
+	if(error){
+		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+	}
+	
+	return;
+}
 
 static int px4_tsdev_get_cn(struct px4_tsdev *tsdev, u32 *cn)
 {
@@ -1268,6 +1379,123 @@ static int px4_tsdev_set_lnb_power(struct px4_tsdev *tsdev, bool enable)
 	return ret;
 }
 
+#if 0
+static int px4_sysctl_debug(SYSCTL_HANDLER_ARGS)
+{
+	struct px4_softc *px4 = (struct px4_softc *)arg1;
+	int val;
+	int error;
+
+	error = sysctl_handle_int( oidp, &val, 0, req );
+	if( error ){
+		return error;
+	}
+	// debug on/off
+	
+	return error;
+}
+#endif
+
+static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS)
+{
+	struct px4_tsdev *tsdev = (struct px4_tsdev *)arg1;
+	struct px4_softc *px4= tsdev->parent;
+	int avail;
+	int lnb;
+	bool b;
+	int error;
+
+	avail = atomic_read(&px4->avail);
+	
+	if( tsdev->isdb != ISDB_S ){
+		dev_dbg(px4->dev, "px4_sysctl_lnb:not ISDB_S\n");	
+		return -EINVAL;
+	}
+	if( !avail ){
+		dev_dbg(px4->dev, "px4_sysctl_lnb:not avail\n");	
+		return -EIO;
+	}
+	
+	error = sysctl_handle_int( oidp, &lnb, 0, req );
+	if( error ){
+		dev_dbg(px4->dev, "px4_sysctl_lnb:error=%d\n", error);	
+		return error;
+	}
+	if( lnb == 0 ){
+		// 0V
+		b = false;
+	}
+	else if( lnb == 2 ){
+		// 15V
+		b = true;
+	}
+	else {
+		dev_dbg(px4->dev, "px4_sysctl_lnb:EINVAL\n");	
+		return -EINVAL;
+	}
+	
+	error= px4_tsdev_set_lnb_power(tsdev, b);
+	dev_dbg(px4->dev, "px4_sysctl_lnb:error=%d\n", error);	
+
+	return error;
+}
+
+static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS)
+{
+	struct px4_tsdev *tsdev = (struct px4_tsdev *)arg1;
+	struct px4_softc *px4= tsdev->parent;
+	int avail;
+	int val = tsdev->freq;
+	struct ptx_freq freq;
+	int error;
+
+	avail = atomic_read(&px4->avail);
+	
+	if( !avail ){
+		dev_dbg(px4->dev, "px4_sysctl_freq:not avail\n");	
+		return -EIO;
+	}
+	
+	error = sysctl_handle_int( oidp, &val, 0, req );
+	if( error || !req->newptr){
+		dev_dbg(px4->dev, "px4_sysctl_freq:error=%d,newptr=%p\n", error, req->newptr);	
+		return error;
+	}
+	tsdev->freq= val;
+	
+	freq.freq_no = (val & 0xffff);
+	freq.slot = ((val >> 16)& 0xffff);
+	
+	error = px4_tsdev_set_channel( tsdev, &freq );
+	dev_dbg(px4->dev, "px4_sysctl_freq:error=%d\n", error);	
+	return error;
+}
+
+static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS)
+{
+	struct px4_tsdev *tsdev = (struct px4_tsdev *)arg1;
+	struct px4_softc *px4= tsdev->parent;
+	int avail;
+	int cn;
+	int error;
+
+	avail = atomic_read(&px4->avail);
+	
+	if( !avail ){
+		return -EIO;
+	}
+	if(req->newptr){
+		return EPERM;
+	}
+	
+	error = px4_tsdev_get_cn(tsdev, (u32 *)&cn);
+	if( error ){
+		return error;
+	}
+	
+	return sysctl_handle_int(oidp, NULL, cn, req);
+}
+
 struct tc90522_regbuf tc_init_s0[] = {
 	{ 0x07, NULL, { 0x31 } },
 	{ 0x08, NULL, { 0x77 } }
@@ -1287,7 +1515,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	
 	int ret = 0, ref;
 	int dev_idx = device_get_unit(px4->dev);
-	unsigned int tsdev_id = tsdev->subunit;
+	unsigned int tsdev_id = tsdev->id;
 	int error;
 	
 	
@@ -1407,7 +1635,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 
 	error = usb_fifo_alloc_buffer( fifo,
 								   usbd_xfer_max_len( bus->usb.transfer[ IT930X_BULK_STREAM_RD ] ),
-								   PX4_IFQ_MAX_LEN );
+								   tsdev_max_packets );
 	if ( error ) {
 	  ret= ENOMEM;
 	  goto fail_after_power;
@@ -1443,7 +1671,7 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	int avail, ref;
 	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
 	struct px4_softc *px4= tsdev->parent;
-	int tsdev_id = tsdev->subunit;
+	int tsdev_id = tsdev->id;
 	
 	if (!tsdev) {
 		pr_err("px4_tsdev_release: tsdev is NULL.\n");
@@ -1494,23 +1722,14 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 }
 
 #if 0
-static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static int px4_tsdev_ioctl(struct usb_fifo *fifo, u_long cmd, void *data, int fflags)
 {
-	long ret = -EIO;
-	struct px4_device *px4;
-	struct px4_tsdev *tsdev;
+	int ret = -EIO;
+	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
+	struct px4_softc *px4= tsdev->parent;
 	int avail;
 	int dev_idx;
 	unsigned int tsdev_id;
-	unsigned long t;
-
-	tsdev = file->private_data;
-	if (!tsdev) {
-		pr_err("px4_tsdev_unlocked_ioctl: tsdev is NULL.\n");
-		return -EFAULT;
-	}
-
-	px4 = container_of(tsdev, struct px4_device, tsdev[tsdev->id]);
 
 	avail = atomic_read(&px4->avail);
 
@@ -1522,23 +1741,22 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 	switch (cmd) {
 	case PTX_SET_CHANNEL:
 	{
-		struct ptx_freq freq;
+		struct ptx_freq *freq;
 
-		dev_dbg(px4->dev, "px4_tsdev_unlocked_ioctl %d:%u: PTX_SET_CHANNEL\n", dev_idx, tsdev_id);
+		dev_dbg(px4->dev, "px4_tsdev_ioctl %d:%u: PTX_SET_CHANNEL\n", dev_idx, tsdev_id);
 
 		if (!avail) {
 			ret = -EIO;
 			break;
 		}
+		freq = (struct ptx_freq *)data;
 
-		t = copy_from_user(&freq, (void *)arg, sizeof(freq));
-
-		ret = px4_tsdev_set_channel(tsdev, &freq);
+		ret = px4_tsdev_set_channel(tsdev, freq);
 		break;
 	}
 
 	case PTX_START_STREAMING:
-		dev_dbg(px4->dev, "px4_tsdev_unlocked_ioctl %d:%u: PTX_START_STREAMING\n", dev_idx, tsdev_id);
+		dev_dbg(px4->dev, "px4_tsdev_ioctl %d:%u: PTX_START_STREAMING\n", dev_idx, tsdev_id);
 
 		if (!avail) {
 			ret = -EIO;
@@ -1549,7 +1767,7 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 		break;
 
 	case PTX_STOP_STREAMING:
-		dev_dbg(px4->dev, "px4_tsdev_unlocked_ioctl %d:%u: PTX_STOP_STREAMING\n", dev_idx, tsdev_id);
+		dev_dbg(px4->dev, "px4_tsdev_ioctl %d:%u: PTX_STOP_STREAMING\n", dev_idx, tsdev_id);
 		ret = px4_tsdev_stop_streaming(tsdev, (avail) ? true : false);
 		break;
 
@@ -1557,7 +1775,7 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 	{
 		int cn = 0;
 
-		dev_dbg(px4->dev, "px4_tsdev_unlocked_ioctl %d:%u: PTX_GET_CNR\n", dev_idx, tsdev_id);
+		dev_dbg(px4->dev, "px4_tsdev_ioctl %d:%u: PTX_GET_CNR\n", dev_idx, tsdev_id);
 
 		if (!avail) {
 			ret = -EIO;
@@ -1566,7 +1784,7 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 
 		ret = px4_tsdev_get_cn(tsdev, (u32 *)&cn);
 		if (!ret)
-			t = copy_to_user((void *)arg, &cn, sizeof(cn));
+			*((int*)data)= cn;
 
 		break;
 	}
@@ -1576,9 +1794,9 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 		int lnb;
 		bool b;
 
-		lnb = (int)arg;
+		lnb = *(int*)data;
 
-		dev_dbg(px4->dev, "px4_tsdev_unlocked_ioctl %d:%u: PTX_ENABLE_LNB_POWER lnb: %d\n", dev_idx, tsdev_id, lnb);
+		dev_dbg(px4->dev, "px4_tsdev_ioctl %d:%u: PTX_ENABLE_LNB_POWER lnb: %d\n", dev_idx, tsdev_id, lnb);
 
 		if (tsdev->isdb != ISDB_S) {
 			ret = -EINVAL;
@@ -1606,7 +1824,7 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 	}
 
 	case PTX_DISABLE_LNB_POWER:
-		dev_dbg(px4->dev, "px4_tsdev_unlocked_ioctl %d:%u: PTX_DISABLE_LNB_POWER\n", dev_idx, tsdev_id);
+		dev_dbg(px4->dev, "px4_tsdev_ioctl %d:%u: PTX_DISABLE_LNB_POWER\n", dev_idx, tsdev_id);
 
 		if (tsdev->isdb != ISDB_S) {
 			ret = -EINVAL;
@@ -1622,7 +1840,7 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 		break;
 
 	default:
-		dev_dbg(px4->dev, "px4_tsdev_unlocked_ioctl %d:%u: unknown ioctl 0x%08x\n", dev_idx, tsdev_id, cmd);
+		dev_dbg(px4->dev, "px4_tsdev_ioctl %d:%u: unknown ioctl 0x%08lx\n", dev_idx, tsdev_id, cmd);
 		ret = -ENOSYS;
 		break;
 	}
@@ -1633,54 +1851,27 @@ static long px4_tsdev_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
 }
 #endif
 
-static int
-px4_ioctl(struct usb_fifo *fifo, u_long cmd, void *data, int fflags)
-{
-  return ENODEV;
-}
-
-#if 0
-static void px4_tsdev_start_read(struct usb_fifo *fifo)
-{
-  struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-  struct px4_softc *px4= tsdev->parent;
-  struct it930x_bus *bus = &px4->it930x.bus;
-
-  usbd_transfer_start( bus->usb.transfer[ IT930X_BULK_STREAM_RD ] );
-}
-
-static void px4_tsdev_stop_read(struct usb_fifo *fifo)
-{
-  struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-  struct px4_softc *px4= tsdev->parent;
-  struct it930x_bus *bus = &px4->it930x.bus;
-
-  usbd_transfer_stop( bus->usb.transfer[ IT930X_BULK_STREAM_RD ] );
-
-}
-#endif
-
 static int px4_probe(device_t dev)
 {
-  struct usb_attach_arg *uaa = device_get_ivars(dev);
-
-  if( uaa->usb_mode != USB_MODE_HOST ){
-    return ENXIO;
-  }
-  
-  if( (uaa->info.idVendor == 0x0511 ) &&
-      ( (uaa->info.idProduct == PID_PX_W3U4  ) ||
-	(uaa->info.idProduct == PID_PX_W3PE4 ) ||
-	(uaa->info.idProduct == PID_PX_Q3U4  ) ||
-	(uaa->info.idProduct == PID_PX_Q3PE4 ) ) &&
-      (uaa->info.bInterfaceClass == UICLASS_VENDOR ) &&
-      (uaa->info.bInterfaceSubClass == 0 ) &&
-      (uaa->info.bInterfaceProtocol == 0 )){
-
-    return BUS_PROBE_SPECIFIC;
-  }
-
-  return ENXIO;
+	struct usb_attach_arg *uaa = device_get_ivars(dev);
+	
+	if( uaa->usb_mode != USB_MODE_HOST ){
+		return ENXIO;
+	}
+	
+	if( (uaa->info.idVendor == 0x0511 ) &&
+		( (uaa->info.idProduct == PID_PX_W3U4  ) ||
+		  (uaa->info.idProduct == PID_PX_W3PE4 ) ||
+		  (uaa->info.idProduct == PID_PX_Q3U4  ) ||
+		  (uaa->info.idProduct == PID_PX_Q3PE4 ) ) &&
+		(uaa->info.bInterfaceClass == UICLASS_VENDOR ) &&
+		(uaa->info.bInterfaceSubClass == 0 ) &&
+		(uaa->info.bInterfaceProtocol == 0 )){
+		
+		return BUS_PROBE_SPECIFIC;
+	}
+	
+	return ENXIO;
 }
 
 static int px4_attach(device_t dev)
@@ -1701,7 +1892,8 @@ static int px4_attach(device_t dev)
 	
 	dev_dbg(dev, "px4_attach: xfer_packets: %u\n", xfer_packets);
 	
-	if( !count ) {
+	if( !atomic_read(&gcount) ) {
+		atomic_add(1, &gcount);
 		mutex_init( &glock );
 		dev_dbg(dev, "px4_attach: initialized glock\n");
 	}
@@ -1741,6 +1933,7 @@ static int px4_attach(device_t dev)
 	px4->dev_idx = dev_idx;
 	px4->serial_number = 0;
 	px4->dev_id = 0;
+	px4->multi_dev = NULL;
 	
 	serial_str =usb_get_serial(uaa->device);
 	
@@ -1829,12 +2022,14 @@ static int px4_attach(device_t dev)
 	
  found:
 	px4->sc_iface_num = idesc->bInterfaceNumber;
-	
+
 	// Initialize px4 structure
 	ret = px4_init(px4);
 	if (ret)
 		goto fail_before_base;
-	
+
+	px4_sysctl_init(px4);
+
 	it930x = &px4->it930x;
 	bus = &it930x->bus;
 	
@@ -1848,7 +2043,8 @@ static int px4_attach(device_t dev)
 	bus->usb.iface_index = iface_index;
 	bus->usb.plock = &px4->lock;
 	bus->usb.fifos_put_bytes_max = px4_fifos_put_bytes_max;
-	
+	bus->usb.streaming_usb_buffer_size = 188 * usb_max_packets;
+
 	ret = it930x_bus_init(bus);
 	if (ret)
 		goto fail_before_bus;
@@ -1917,62 +2113,71 @@ static int px4_attach(device_t dev)
 		goto fail;
 
 	// create /dev/px4video*
-
-	// unit, subunit -> /dev/px4(unit).(subunit)[st]
-	int subunit;
-	for( subunit = 0; subunit< TSDEV_NUM; subunit++ ){
-		px4->tsdev[ subunit ].subunit = subunit;
-		px4->tsdev[ subunit ].parent = px4;
-    
-		error= usb_fifo_attach( uaa->device, &px4->tsdev[ subunit ],
+	for( i = 0; i < TSDEV_NUM; i++ ){
+		px4->tsdev[ i ].parent = px4;
+		px4_fifo_methods.postfix[0]= i/2 ? "t": "s";
+		
+		error= usb_fifo_attach( uaa->device, &px4->tsdev[ i ],
 								&px4->lock,
-								&px4_fifo_methods, &px4->sc_fifo[subunit], dev_idx, subunit,
-								iface_index, UID_ROOT, GID_OPERATOR, 0644);
+								&px4_fifo_methods, &px4->sc_fifo[ i ], dev_idx, i,
+								iface_index, UID_ROOT, GID_OPERATOR, 0666);
     
 		if (error )
-			goto fail;
+			goto fail_fifo;
 	}
-  
+	dev_dbg(dev, "px4_attach: created /dev/px4video\n");
+	devs[dev_idx] = px4;
 
-  devs[dev_idx] = px4;
+	dev_dbg(dev, "px4_attach: start test\n");
 
-  mutex_unlock(&glock);
+	it930x_write_gpio(it930x, 2, false);
+	it930x_write_gpio(it930x, 7, true);
 
-  return 0;
+	//dev_dbg(dev, "it930x=%p px4->it930x=%p\n",it930x, &px4->it930x);
+	
+	//dev_dbg(dev, "px4_attach: poweroff\n");
+	//px4_set_power(px4, false);
+	//dev_dbg(dev, "px4_attach: poweroff done\n");
+	
+	mutex_unlock(&glock);
+	
+	return 0;
+
+ fail_fifo:
+	for (i = 0; i < TSDEV_NUM; i++)
+		usb_fifo_detach( &px4->sc_fifo[i]);
 
  fail:
-  it930x_term(it930x);
+	it930x_term(it930x);
  fail_before_bridge:
-  it930x_bus_term(bus);
+	it930x_bus_term(bus);
  fail_before_bus:
-  px4_term(px4);
+	px4_term(px4);
  fail_before_base:
-  if (px4) {
-    if (px4->multi_dev) {
-      struct px4_multi_device *multi_dev = px4->multi_dev;
+	if (px4) {
+		if (px4->multi_dev) {
+			struct px4_multi_device *multi_dev = px4->multi_dev;
+			
+			mutex_lock(&multi_dev->lock);
+			
+			for (i = 0; i < 2; i++) {
+				if (multi_dev->devs[i] == px4)
+					multi_dev->devs[i] = NULL;
+			}
+			
+			if (!--multi_dev->ref)
+				kfree(multi_dev);
+			else
+				mutex_unlock(&multi_dev->lock);
+		}
+		
+		if (px4->stream_context)
+			kfree(px4->stream_context);
+	}
+	
+	mutex_unlock(&glock);
 
-      mutex_lock(&multi_dev->lock);
-
-      for (i = 0; i < 2; i++) {
-	if (multi_dev->devs[i] == px4)
-	  multi_dev->devs[i] = NULL;
-      }
-
-      if (!--multi_dev->ref)
-	kfree(multi_dev);
-      else
-	mutex_unlock(&multi_dev->lock);
-    }
-
-    if (px4->stream_context)
-      kfree(px4->stream_context);
-  }
-
-  mutex_unlock(&glock);
-
-  px4_detach( dev );
-  
-  return ret;
+	return ret;
 }
 
 static int px4_detach(device_t dev)
@@ -2054,7 +2259,7 @@ static device_method_t px4_methods[] = {
 };
 
 static driver_t px4_driver = {
-	"px4",
+	DEVICE_NAME,
 	px4_methods,
 	sizeof(struct px4_softc)
 };
