@@ -13,6 +13,7 @@ enum {
       IT930X_BULK_STREAM_RD,
       IT930X_N_TRANSFER
 };
+#define IT930X_BUS_TRANSFERRED (1)
 
 #else
 #include <linux/device.h>
@@ -63,13 +64,11 @@ struct it930x_bus {
 			u32 streaming_usb_buffer_size;
 			uint8_t iface_num;
 			uint8_t iface_index;
-			struct mtx* plock;
 			struct usb_xfer *transfer[IT930X_N_TRANSFER];
 			uint8_t zero_length_packets;
-			struct cv tx_cv;
-			struct mtx xfer_tx_mtx;
-			struct cv rx_cv;
-			struct mtx xfer_rx_mtx;
+			struct cv xfer_cv;
+			struct mtx xfer_mtx;
+			u32 event;
 			bool (*fifos_put_bytes_max)(void *context);
 #endif
 		} usb;

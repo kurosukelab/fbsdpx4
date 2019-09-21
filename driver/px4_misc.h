@@ -61,7 +61,6 @@
 #define mdelay(M)	DELAY((M)*1000)
 #define __user
   
-#define ULLONG_MAX	0xffffffffffffffffULL
 #define EREMOTEIO	EIO
 
 #define FIRMWARE_FILENAME	"it930x_fw"

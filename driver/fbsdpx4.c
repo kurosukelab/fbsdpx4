@@ -20,6 +20,7 @@
 #include <sys/selinfo.h>
 #include <sys/conf.h>
 #include <sys/fcntl.h>
+#include <sys/limits.h>
 #include <machine/atomic.h>
 
 #include <dev/usb/usb.h>
@@ -167,6 +168,24 @@ static struct usb_fifo_methods px4_fifo_methods = {
 	.postfix[0] = "s"
 };
 
+static void px4_watchdog(void *arg);
+
+static void px4_watchdog_reset(struct px4_softc *px4)
+{
+	usb_callout_reset( &px4->sc_watchdog, hz, &px4_watchdog, px4 );
+}
+
+static void px4_watchdog(void *arg)
+{
+	struct px4_softc *px4 = arg;
+	//static int count=0;
+
+	// get throughput...
+	//printf("count=%d\n", ++count );
+	
+	px4_watchdog_reset( px4 );
+}
+
 //static int px4_sysctl_debug(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS);
@@ -263,6 +282,8 @@ static int px4_init(struct px4_softc *px4)
 	//init_waitqueue_head(&px4->wait);
 	
 	mutex_init(&px4->lock);
+	usb_callout_init_mtx(&px4->sc_watchdog, &px4->lock, 0 );
+	
 	px4->lnb_power_count = 0;
 	px4->streaming_count = 0;
 
@@ -295,6 +316,8 @@ static int px4_term(struct px4_softc *px4)
 	}
 #endif
 
+	usb_callout_drain( &px4->sc_watchdog );
+	
 	cv_destroy( &px4->wait_cv );
 	mtx_destroy( &px4->wait_mtx );
 	mtx_destroy( &px4->lock);
@@ -2041,7 +2064,6 @@ static int px4_attach(device_t dev)
 	bus->usb.ctrl_timeout = 3000;
 	bus->usb.iface_num = idesc->bInterfaceNumber;
 	bus->usb.iface_index = iface_index;
-	bus->usb.plock = &px4->lock;
 	bus->usb.fifos_put_bytes_max = px4_fifos_put_bytes_max;
 	bus->usb.streaming_usb_buffer_size = 188 * usb_max_packets;
 
@@ -2118,7 +2140,7 @@ static int px4_attach(device_t dev)
 		px4_fifo_methods.postfix[0]= i/2 ? "t": "s";
 		
 		error= usb_fifo_attach( uaa->device, &px4->tsdev[ i ],
-								&px4->lock,
+								&bus->usb.xfer_mtx,
 								&px4_fifo_methods, &px4->sc_fifo[ i ], dev_idx, i,
 								iface_index, UID_ROOT, GID_OPERATOR, 0666);
     
@@ -2127,17 +2149,10 @@ static int px4_attach(device_t dev)
 	}
 	dev_dbg(dev, "px4_attach: created /dev/px4video\n");
 	devs[dev_idx] = px4;
-
-	dev_dbg(dev, "px4_attach: start test\n");
-
-	it930x_write_gpio(it930x, 2, false);
-	it930x_write_gpio(it930x, 7, true);
-
-	//dev_dbg(dev, "it930x=%p px4->it930x=%p\n",it930x, &px4->it930x);
 	
-	//dev_dbg(dev, "px4_attach: poweroff\n");
-	//px4_set_power(px4, false);
-	//dev_dbg(dev, "px4_attach: poweroff done\n");
+	mutex_lock( &px4->lock );
+	px4_watchdog_reset( px4 );
+	mutex_unlock( &px4->lock );
 	
 	mutex_unlock(&glock);
 	
@@ -2193,6 +2208,8 @@ static int px4_detach(device_t dev)
 	atomic_set(&px4->avail, 0);
 	mutex_lock(&px4->lock);
 
+	usb_callout_stop( &px4->sc_watchdog );
+	
 	mutex_lock(&glock);
 
 	devs[px4->dev_idx] = NULL;
