@@ -281,8 +281,9 @@ static int px4_init(struct px4_softc *px4)
 	mutex_init(&px4->wait_mtx);
 	//init_waitqueue_head(&px4->wait);
 	
-	mutex_init(&px4->lock);
-	usb_callout_init_mtx(&px4->sc_watchdog, &px4->lock, 0 );
+	//mutex_init(&px4->lock);
+	mtx_init(&px4->lock, "px4", "px4->lock", MTX_DEF | MTX_RECURSE );
+	//usb_callout_init_mtx(&px4->sc_watchdog, &px4->lock, 0 );
 	
 	px4->lnb_power_count = 0;
 	px4->streaming_count = 0;
@@ -316,7 +317,7 @@ static int px4_term(struct px4_softc *px4)
 	}
 #endif
 
-	usb_callout_drain( &px4->sc_watchdog );
+	//usb_callout_drain( &px4->sc_watchdog );
 	
 	cv_destroy( &px4->wait_cv );
 	mtx_destroy( &px4->wait_mtx );
@@ -1160,7 +1161,7 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 #if defined(__FreeBSD__)
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: urb_buffer_size: %u, urb_num: %u, no_dma: %c\n", px4->dev_idx, tsdev->id, bus->usb.streaming_usb_buffer_size, bus->usb.streaming_urb_num, (bus->usb.streaming_no_dma) ? 'Y' : 'N');
 		
-		usbd_transfer_stop( bus->usb.transfer[ IT930X_BULK_STREAM_RD ] );
+		usbd_transfer_stop( bus->usb.transfer[ IT930X_BUS_BULK_STREAM_RD ] );
 		
 #else		
 		bus->usb.streaming_urb_buffer_size = 188 * urb_max_packets;
@@ -1657,7 +1658,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	}
 
 	error = usb_fifo_alloc_buffer( fifo,
-								   usbd_xfer_max_len( bus->usb.transfer[ IT930X_BULK_STREAM_RD ] ),
+								   usbd_xfer_max_len( bus->usb.transfer[ IT930X_BUS_BULK_STREAM_RD ] ),
 								   tsdev_max_packets );
 	if ( error ) {
 	  ret= ENOMEM;
@@ -2064,6 +2065,7 @@ static int px4_attach(device_t dev)
 	bus->usb.ctrl_timeout = 3000;
 	bus->usb.iface_num = idesc->bInterfaceNumber;
 	bus->usb.iface_index = iface_index;
+	bus->usb.px4_lock= &px4->lock;
 	bus->usb.fifos_put_bytes_max = px4_fifos_put_bytes_max;
 	bus->usb.streaming_usb_buffer_size = 188 * usb_max_packets;
 
@@ -2140,7 +2142,7 @@ static int px4_attach(device_t dev)
 		px4_fifo_methods.postfix[0]= i/2 ? "t": "s";
 		
 		error= usb_fifo_attach( uaa->device, &px4->tsdev[ i ],
-								&bus->usb.xfer_mtx,
+								&px4->lock,
 								&px4_fifo_methods, &px4->sc_fifo[ i ], dev_idx, i,
 								iface_index, UID_ROOT, GID_OPERATOR, 0666);
     
@@ -2150,9 +2152,9 @@ static int px4_attach(device_t dev)
 	dev_dbg(dev, "px4_attach: created /dev/px4video\n");
 	devs[dev_idx] = px4;
 	
-	mutex_lock( &px4->lock );
-	px4_watchdog_reset( px4 );
-	mutex_unlock( &px4->lock );
+	//mutex_lock( &px4->lock );
+	//px4_watchdog_reset( px4 );
+	//mutex_unlock( &px4->lock );
 	
 	mutex_unlock(&glock);
 	
@@ -2208,7 +2210,7 @@ static int px4_detach(device_t dev)
 	atomic_set(&px4->avail, 0);
 	mutex_lock(&px4->lock);
 
-	usb_callout_stop( &px4->sc_watchdog );
+	//usb_callout_stop( &px4->sc_watchdog );
 	
 	mutex_lock(&glock);
 

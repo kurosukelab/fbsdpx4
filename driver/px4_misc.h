@@ -38,7 +38,7 @@
 #define pr_err(fmt,...) printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__)
 
 
-#define mutex_init(A)		mtx_init(A, "px4", NULL, MTX_DEF)
+#define mutex_init(A)		mtx_init(A, "px4" , #A, MTX_DEF)
 #define mutex_lock(A)		mtx_lock(A)
 #define mutex_unlock(A)		mtx_unlock(A)
 #define mutex_destroy(A)	mtx_destroy(A)
@@ -53,7 +53,7 @@
 #define atomic_t int
 #define atomic_add(I,V) atomic_add_32(V,I)
 #define atomic_sub(I,V)	atomic_subtract_32(V,I)
-#define atomic_set(V,I) atomic_set_32(V,I)
+#define atomic_set(V,I) atomic_store_32(V,I)
 #define atomic_add_return(I,V) (I+atomic_fetchadd_32(V,I))
 #define atomic_sub_return(I,V) (atomic_fetchadd_32(V,-I)-I)
 #define atomic_read(V)	atomic_load_32(V)

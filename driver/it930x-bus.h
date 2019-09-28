@@ -8,12 +8,14 @@
 #include <dev/usb/usbdi.h>
 
 enum {
-      IT930X_BULK_WR,
-      IT930X_BULK_RD,
-      IT930X_BULK_STREAM_RD,
-      IT930X_N_TRANSFER
+      IT930X_BUS_BULK_WR,
+      IT930X_BUS_BULK_RD,
+      IT930X_BUS_BULK_STREAM_RD,
+      IT930X_BUS_N_TRANSFER
 };
 #define IT930X_BUS_TRANSFERRED (1)
+#define IT930X_BUS_BUF_SIZE (256)
+#define IT930X_BUS_CMD_MAX_BUFFERS (2)
 
 #else
 #include <linux/device.h>
@@ -42,6 +44,17 @@ struct it930x_bus_operations {
 	int (*start_streaming)(struct it930x_bus *bus, it930x_bus_on_stream_t on_stream, void *context);
 	int (*stop_streaming)(struct it930x_bus *bus);
 };
+#if defined(__FreeBSD__)
+
+struct it930x_bus_cmd_buf {
+	TAILQ_ENTRY(it930x_bus_cmd_buf) entry;
+	uint32_t len;
+	uint8_t buf[ IT930X_BUS_BUF_SIZE ];
+};
+
+TAILQ_HEAD(it930x_bus_cmd_head, it930x_bus_cmd_buf);
+  
+#endif
 
 struct it930x_bus {
 #if defined(__FreeBSD__)
@@ -64,10 +77,17 @@ struct it930x_bus {
 			u32 streaming_usb_buffer_size;
 			uint8_t iface_num;
 			uint8_t iface_index;
-			struct usb_xfer *transfer[IT930X_N_TRANSFER];
+			struct usb_xfer *transfer[IT930X_BUS_N_TRANSFER];
 			uint8_t zero_length_packets;
+			struct it930x_bus_cmd_head xfer_tx_head;
+			struct it930x_bus_cmd_head cmd_buf_free;
+			struct it930x_bus_cmd_head cmd_tx_buf_pending;
+			struct it930x_bus_cmd_buf cmd_buf[ IT930X_BUS_CMD_MAX_BUFFERS ];
+			struct it930x_bus_cmd_head xfer_rx_head;
+			struct it930x_bus_cmd_head cmd_rx_buf_pending;
 			struct cv xfer_cv;
 			struct mtx xfer_mtx;
+			struct mtx *px4_lock;
 			u32 event;
 			bool (*fifos_put_bytes_max)(void *context);
 #endif
