@@ -123,8 +123,7 @@ void it930x_usb_bulk_tx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 	case USB_ST_TRANSFERRED:
 		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
 		bus->usb.event |= IT930X_BUS_TRANSFERRED;
-		dev_dbg( bus->dev,"transferred\n");
-		
+		//break;
 	case USB_ST_SETUP:
 	tr_setup:
 		cb = TAILQ_FIRST( &bus->usb.cmd_tx_buf_pending );
@@ -139,7 +138,6 @@ void it930x_usb_bulk_tx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 			usbd_xfer_set_frames( transfer, 1 );
 			usbd_xfer_set_frame_data( transfer, 0, cb->buf, cb->len);
 			usbd_transfer_submit(transfer);
-			dev_dbg( bus->dev,"submit\n");
 		}
 		break;
 	default:
@@ -151,7 +149,6 @@ void it930x_usb_bulk_tx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 			}
 			goto tr_setup;
 		}
-		dev_dbg( bus->dev,"comp ,error=%d\n", error);
 		bus->usb.event = -1;
 		break;
 	}
@@ -171,7 +168,6 @@ void it930x_usb_bulk_rx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 	switch (USB_GET_STATE(transfer)) {
 	case USB_ST_TRANSFERRED:
 		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
-		dev_dbg(bus->dev, "rx transferred\n");
 		bus->usb.event |= IT930X_BUS_TRANSFERRED;
 		//break;
 	case USB_ST_SETUP:
@@ -189,7 +185,6 @@ void it930x_usb_bulk_rx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 		usbd_xfer_set_frame_len( transfer, 0, max );
 		usbd_transfer_submit(transfer);
 		
-		dev_dbg(bus->dev, "rx submit\n");
 		break;
 	default:
 		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );

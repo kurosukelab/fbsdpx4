@@ -434,21 +434,16 @@ static int px4_set_power(struct px4_softc *px4, bool on)
 
 			mutex_unlock(&multi_dev->lock);
 		} else {
-			dev_dbg(px4->dev, "px4_set_power: write_gpio 7\n" );
 			ret = it930x_write_gpio(it930x, 7, false);
 			if (ret)
 				goto exit;
 		}
-		dev_dbg(px4->dev, "px4_set_power: write_gpio 7 done.\n" );
 		
 		pause( NULL, MSEC_2_TICKS( 100 ));
 		
-		dev_dbg(px4->dev, "px4_set_power: write_gpio 2\n" );
 		ret = it930x_write_gpio(it930x, 2, true);
 		if (ret)
 			goto exit;
-
-		dev_dbg(px4->dev, "px4_set_power: write_gpio 2 done.\n" );
 
 		pause( NULL, MSEC_2_TICKS( 20 ));
 
