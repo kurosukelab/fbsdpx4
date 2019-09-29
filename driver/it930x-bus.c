@@ -16,6 +16,8 @@
 
 #include "px4_misc.h"
 
+#define IT930X_BUS_DISCARD_PACKETS (2);
+
 #else
 #include "print_format.h"
 
@@ -214,7 +216,7 @@ void it930x_usb_stream_callback(struct usb_xfer *transfer, usb_error_t error)
 	case USB_ST_TRANSFERRED:
 		if( actual == 0 ){
 			bus->usb.zero_length_packets++;
-			usbd_xfer_set_interval(transfer, 30);
+			//usbd_xfer_set_interval(transfer, 30);
 		}
 		else {
 			if(bus->usb.zero_length_packets){
@@ -223,16 +225,29 @@ void it930x_usb_stream_callback(struct usb_xfer *transfer, usb_error_t error)
 			usbd_xfer_set_interval(transfer, 0);
 			bus->usb.zero_length_packets = 0;
 			pc = usbd_xfer_get_frame( transfer, 0 );
-			ctx->on_stream(context, pc );
+
+			if(bus->usb.discard_packets > 0 ){
+				bus->usb.discard_packets--;
+			}
+			
+			if(!bus->usb.discard_packets){
+				ctx->on_stream(context, pc , actual);
+			}
 		}
 	case USB_ST_SETUP:
-	setup:
-		if(bus->usb.fifos_put_bytes_max != NULL){
+	tr_setup:
+		if((bus->usb.fifos_put_bytes_max != NULL) && ( context != NULL )){
 			if((*bus->usb.fifos_put_bytes_max)(context)){
 				max = usbd_xfer_max_len( transfer );
 				usbd_xfer_set_frame_len( transfer, 0, max );
 				usbd_transfer_submit(transfer);
 			}
+			else {
+				dev_dbg(bus->dev, "stream fifo has no space\n");
+			}
+		}
+		else {
+			dev_dbg(bus->dev, "stream fifos_put_bytes_max=%p context=%p\n", bus->usb.fifos_put_bytes_max, context);
 		}
 		
 		break;
@@ -242,7 +257,7 @@ void it930x_usb_stream_callback(struct usb_xfer *transfer, usb_error_t error)
 		
 		if( error != USB_ERR_CANCELLED ){
 			usbd_xfer_set_stall( transfer );
-			goto setup;
+			goto tr_setup;
 		}
 		break;
 	}
@@ -614,7 +629,9 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 #endif
 
 #if defined(__FreeBSD__)
+	bus->usb.discard_packets = IT930X_BUS_DISCARD_PACKETS;
 	usbd_xfer_set_stall(bus->usb.transfer[ IT930X_BUS_BULK_STREAM_RD ]);
+	usbd_transfer_start( bus->usb.transfer[ IT930X_BUS_BULK_STREAM_RD ] );
 #else
 	usb_reset_endpoint(dev, 0x84);
 	
@@ -636,9 +653,7 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 		goto fail;
 #endif
 
-#if defined(__FreeBSD__)
-	usbd_transfer_start( bus->usb.transfer[ IT930X_BUS_BULK_STREAM_RD ] );
-#else
+#if !defined(__FreeBSD__)
 	dev_dbg(bus->dev, "it930x_usb_start_streaming: n: %u\n", n);
 
 	ctx->num_urb = n;
@@ -785,6 +800,7 @@ int it930x_bus_init(struct it930x_bus *bus)
 				cv_init( &bus->usb.xfer_cv, "it930x-bus");
 				mtx_init( &bus->usb.xfer_mtx, "it930x-bus", NULL, MTX_DEF | MTX_RECURSE);
 				bus->usb.event = 0;
+				bus->usb.discard_packets = IT930X_BUS_DISCARD_PACKETS;
 				
 				it930x_config[IT930X_BUS_BULK_STREAM_RD].bufsize = bus->usb.streaming_usb_buffer_size;
 

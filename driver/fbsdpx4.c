@@ -586,18 +586,67 @@ static bool px4_ts_sync(u8 **buf, u32 *len, bool *sync_remain)
 	return ret;
 }
 
+static bool px4_ts_sync_with_page_cache(struct usb_page_cache *pc, usb_frlength_t *offset, u32 *len, bool *sync_remain)
+{
+	bool ret = false;
+	u32 remain = *len;
+	bool b = false;
+
+	struct usb_page_search res;
+	u8 *tmp;
+
+	while (remain) {
+		u32 i;
+		for (i = 0; i < TS_SYNC_COUNT; i++) {
+			if (((i + 1) * 188) <= remain) {
+				usbd_get_page(pc, *offset + i*188 , &res);
+				tmp= res.buffer;
+				
+				if ((tmp[0] & 0x8f) != 0x07)
+					break;
+			} else {
+				b = true;
+				break;
+			}
+		}
+		
+		if (i == TS_SYNC_COUNT) {
+			// ok
+			ret = true;
+			break;
+		}
+
+		if (b)
+			break;
+
+		remain -= 1;
+		*offset += 1;
+	}
+
+	*len = remain;
+	*sync_remain = b;
+
+	return ret;
+}
+
 static void px4_ts_write(struct usb_fifo **sc_fifo_open, u8 **buf, u32 *len)
 {
 
 	u8 *p = *buf;
 	u32 remain = *len;
+	u32 lastflag = (remain < 188*2);
 
 	while (remain >= 188 && ((p[0] & 0x8f) == 0x07)) {
 		u8 id = (p[0] & 0x70) >> 4;
 
 		if (id && id < 5) {
 			p[0] = 0x47;
-			usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, 188, 1);
+			if (sc_fifo_open[id - 1 ]){
+				usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, 188, lastflag);
+			}
+			else {
+				pr_debug("%s:sc_fifo_open[%d] is NULL\n",__FUNCTION__, id-1 );
+			}
 		} else {
 			pr_debug("px4_ts_write: unknown id %d\n", id);
 		}
@@ -612,41 +661,87 @@ static void px4_ts_write(struct usb_fifo **sc_fifo_open, u8 **buf, u32 *len)
 	return;
 }
 
-static int px4_on_stream(void *context, struct usb_page_cache *pc)
+static void px4_ts_write_with_page_cache(struct usb_fifo **sc_fifo_open, struct usb_page_cache *pc, usb_frlength_t *offset, u32 *len)
+{
+
+	u8 *p;
+	u32 remain = *len;
+	struct usb_page_search res;
+	s32 page_len;
+	u32 lastflag = (remain < 188*2);
+
+	usbd_get_page(pc, *offset, &res);
+	p= res.buffer;
+	page_len= res.length;
+
+	while (remain >= 188 && ((p[0] & 0x8f) == 0x07)) {
+		u8 id = (p[0] & 0x70) >> 4;
+
+		if (id && id < 5) {
+			p[0] = 0x47;
+			if (sc_fifo_open[id - 1 ]){
+				if(page_len < 188) {
+					usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, page_len, 0);
+					usb_fifo_put_data( sc_fifo_open[id - 1], pc, *offset + page_len, 188-page_len, lastflag );
+				}
+				else {
+					usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, 188, lastflag);
+				}
+			}
+			else {
+				pr_debug("%s:sc_fifo_open[%d] is NULL\n",__FUNCTION__, id-1 );
+			}
+		} else {
+			pr_debug("px4_ts_write: unknown id %d\n", id);
+		}
+		
+		page_len -= 188;
+		remain -= 188;
+		*offset += 188;
+		
+		if( page_len < 0 ){
+			usbd_get_page(pc, *offset, &res);
+			p= res.buffer;
+			page_len= res.length;
+		}
+		else {
+			p += 188;
+		}
+	}
+
+	*len = remain;
+
+	return;
+}
+
+static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
 {
 	struct px4_stream_context *stream_context = context;
 	u8 *context_remain_buf = stream_context->remain_buf;
 	u32 context_remain_len = stream_context->remain_len;
-	struct usb_page_search res;
-	u8 *p;
-	u32 remain;
-	u32 len;
+	u32 remain = len;
+	usb_frlength_t offset=0;
 	bool sync_remain = false;
 
-	usbd_get_page(pc, 0, &res);
-	len= res.length;
-	remain= len;
-	p= res.buffer;
-	
 	if (context_remain_len) {
 		if ((context_remain_len + len) >= TS_SYNC_SIZE) {
 			u32 l;
 
 			l = TS_SYNC_SIZE - context_remain_len;
 
-			memcpy(context_remain_buf + context_remain_len, p, l);
+			usbd_copy_out( pc, offset, context_remain_buf + context_remain_len, l );
 			context_remain_len = TS_SYNC_SIZE;
 
 			if (px4_ts_sync(&context_remain_buf, &context_remain_len, &sync_remain)) {
 				px4_ts_write(stream_context->sc_fifo_open, &context_remain_buf, &context_remain_len);
 
-				p += l;
+				offset += l;
 				remain -= l;
 			}
 
 			stream_context->remain_len = 0;
 		} else {
-			memcpy(context_remain_buf + context_remain_len, p, len);
+			usbd_copy_out( pc, offset, context_remain_buf + context_remain_len, len );
 			stream_context->remain_len += len;
 
 			return 0;
@@ -654,14 +749,14 @@ static int px4_on_stream(void *context, struct usb_page_cache *pc)
 	}
 
 	while (remain) {
-		if (!px4_ts_sync(&p, &remain, &sync_remain))
+		if (!px4_ts_sync_with_page_cache( pc, &offset, &remain, &sync_remain))
 			break;
 
-		px4_ts_write(stream_context->sc_fifo_open, &p, &remain);
+		px4_ts_write_with_page_cache(stream_context->sc_fifo_open, pc, &offset, &remain);
 	}
 
 	if (sync_remain) {
-		memcpy(stream_context->remain_buf, p, remain);
+		usbd_copy_out( pc, offset, stream_context->remain_buf, remain );
 		stream_context->remain_len = remain;
 	}
 
@@ -1207,7 +1302,7 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 	if (ret)
 		goto fail;
 
-#if 0
+#if !defined(__FreeBSD__)
 	ret = ringbuffer_alloc(tsdev->ringbuf, ringbuffer_size);
 	if (ret)
 		goto fail;
@@ -2028,7 +2123,6 @@ static int px4_attach(device_t dev)
 			if (idesc->bInterfaceNumber != uaa->info.bIfaceNum)
 				break;
 			else {
-				device_printf(dev, "bInterfaceNumber =%d\n", uaa->info.bIfaceNum );
 				goto found;
 				
 			}

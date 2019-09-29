@@ -30,7 +30,7 @@ typedef enum {
 } it930x_bus_type_t;
 
 #if defined(__FreeBSD__)
-typedef int (*it930x_bus_on_stream_t)(void *context, struct usb_page_cache *pc);
+typedef int (*it930x_bus_on_stream_t)(void *context, struct usb_page_cache *pc, u32 len);
 #else
 typedef int (*it930x_bus_on_stream_t)(void *context, void *buf, u32 len);
 #endif
@@ -79,6 +79,7 @@ struct it930x_bus {
 			uint8_t iface_index;
 			struct usb_xfer *transfer[IT930X_BUS_N_TRANSFER];
 			uint8_t zero_length_packets;
+			uint8_t discard_packets;
 			struct it930x_bus_cmd_head xfer_tx_head;
 			struct it930x_bus_cmd_head cmd_buf_free;
 			struct it930x_bus_cmd_head cmd_tx_buf_pending;

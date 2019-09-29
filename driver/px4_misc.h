@@ -25,7 +25,7 @@
 
 #ifdef DEBUG
 #define dev_dbg(dev,fmt,...) device_printf(dev,"DEBUG:" fmt, ##__VA_ARGS__)
-#define pr_debug(fmt,...) printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__)
+#define pr_debug(fmt,...) printf(fmt, ##__VA_ARGS__)
 #else
 #define dev_dbg(dev,fmt,...)
 #define pr_debug(fmt,...)
