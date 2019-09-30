@@ -2,7 +2,6 @@
 
 FreeNASで録画サーバーを運用したいためにPLEX PX-W3U4/Q3U4/W3PE4/Q3PE4用の非公式版Linuxドライバをfbsdpt3を参考にFreeBSDに移植してみました。  
 [非公式版Linuxドライバ](https://github.com/nns779/px4_drv)のv0.2.1aをベースにしています。  
-PLEX社の[Webサイト](http://plex-net.co.jp)にて配布されている公式Linuxドライバとは**別物**です。
 
 Kernel Panicが発生する可能性があります。  
 PX-Q3PE4にて、地上波の1channelのみ動作確認中。  
@@ -21,15 +20,15 @@ PX-Q3PE4にて、地上波の1channelのみ動作確認中。
 	$ make
 	$ cd ../fwimage
 	$ make
-	$ sudo cp it930x_fw.ko /boot/kernel
-	$ sudo chmod a+x /boot/kernel/it930x_fw.ko
+	$ sudo make install
 	$ cd ../
 
 ### 2. ドライバのインストール
 
 	$ cd driver
 	$ make
-	$ sudo cp fbsdpx4.ko /boot/kernel
+	$ sudo make install
+	
 ### 3. ドライバのロード
 	$ sudo kldload fbsdpx4.ko
 
