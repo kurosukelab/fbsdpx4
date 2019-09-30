@@ -30,7 +30,7 @@ PX-Q3PE4にて、地上波の1channelのみ動作確認中。
 	$ sudo make install
 	
 ### 3. ドライバのロード
-	$ sudo kldload fbsdpx4.ko
+	$ sudo kldload px4.ko
 
 ### 3. 確認
 
