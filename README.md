@@ -4,7 +4,10 @@ FreeNASで録画サーバーを運用したいためにPLEX PX-W3U4/Q3U4/W3PE4/Q
 [非公式版Linuxドライバ](https://github.com/nns779/px4_drv)のv0.2.1aをベースにしています。  
 
 Kernel Panicが発生する可能性があります。  
-PX-Q3PE4にて、地上波の1channelのみ動作確認中。  
+BSがないので、PX-W3U4/W3PE4相当のデバイスに地上波2channelの多重でMirakurun/Chinachu動作確認中。  
+10msのpauseではmtx_lockが奪えないみたいで、  
+channel変更中にもう一方のdevがcloseされるとsuできない状態に...  
+また、Mirakurun動作中にデバイスロードするとKernel Panic発生します。  
 
 ## 対応デバイス
 

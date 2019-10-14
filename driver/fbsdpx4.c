@@ -91,6 +91,8 @@ struct px4_tsdev {
 
 struct px4_stream_context {
 	struct usb_fifo *sc_fifo_open[ TSDEV_NUM ];
+	size_t number_of_packets[ TSDEV_NUM ];
+	size_t threshold_packet_size[ TSDEV_NUM ];
 	u8 remain_buf[TS_SYNC_SIZE];
 	size_t remain_len;
 };
@@ -300,6 +302,8 @@ static int px4_init(struct px4_softc *px4)
 
 		tsdev->sc_fifo_open= NULL;
 		px4->stream_context->sc_fifo_open[ i ] = NULL;
+		px4->stream_context->number_of_packets[ i ] = 0;
+		px4->stream_context->threshold_packet_size[ i ] = 0;
 	}
 
 	return ret;
@@ -629,12 +633,12 @@ static bool px4_ts_sync_with_page_cache(struct usb_page_cache *pc, usb_frlength_
 	return ret;
 }
 
-static void px4_ts_write(struct usb_fifo **sc_fifo_open, u8 **buf, u32 *len)
+static void px4_ts_write(struct usb_fifo **sc_fifo_open, u8 **buf, u32 *len, size_t* packets, size_t* threshold)
 {
 
 	u8 *p = *buf;
 	u32 remain = *len;
-	u32 lastflag = (remain < 188*2);
+	u32 lastflag;
 
 	while (remain >= 188 && ((p[0] & 0x8f) == 0x07)) {
 		u8 id = (p[0] & 0x70) >> 4;
@@ -642,10 +646,19 @@ static void px4_ts_write(struct usb_fifo **sc_fifo_open, u8 **buf, u32 *len)
 		if (id && id < 5) {
 			p[0] = 0x47;
 			if (sc_fifo_open[id - 1 ]){
-				usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, 188, lastflag);
-			}
-			else {
-				pr_debug("%s:sc_fifo_open[%d] is NULL\n",__FUNCTION__, id-1 );
+				if( usb_fifo_put_bytes_max(sc_fifo_open[ id - 1 ]) ){
+					lastflag = ( packets[ id - 1 ] > threshold[ id - 1 ] );
+
+					usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, 188, lastflag);
+
+					if(lastflag)
+						packets[ id - 1 ]= 0;
+					else
+						packets[ id - 1 ]++;
+				}
+				else {
+					pr_debug("%s:fifo[%d] has no space\n", __FUNCTION__, id - 1);
+				}
 			}
 		} else {
 			pr_debug("px4_ts_write: unknown id %d\n", id);
@@ -661,14 +674,14 @@ static void px4_ts_write(struct usb_fifo **sc_fifo_open, u8 **buf, u32 *len)
 	return;
 }
 
-static void px4_ts_write_with_page_cache(struct usb_fifo **sc_fifo_open, struct usb_page_cache *pc, usb_frlength_t *offset, u32 *len)
+static void px4_ts_write_with_page_cache(struct usb_fifo **sc_fifo_open, struct usb_page_cache *pc, usb_frlength_t *offset, u32 *len, size_t* packets, size_t* threshold)
 {
 
 	u8 *p;
 	u32 remain = *len;
 	struct usb_page_search res;
 	s32 page_len;
-	u32 lastflag = (remain < 188*2);
+	u32 lastflag;
 
 	usbd_get_page(pc, *offset, &res);
 	p= res.buffer;
@@ -679,17 +692,24 @@ static void px4_ts_write_with_page_cache(struct usb_fifo **sc_fifo_open, struct 
 
 		if (id && id < 5) {
 			p[0] = 0x47;
-			if (sc_fifo_open[id - 1 ]){
-				if(page_len < 188) {
-					usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, page_len, 0);
-					usb_fifo_put_data( sc_fifo_open[id - 1], pc, *offset + page_len, 188-page_len, lastflag );
+			if (sc_fifo_open[ id - 1 ]){
+				if( usb_fifo_put_bytes_max(sc_fifo_open[ id - 1 ]) ){
+					lastflag = ( packets[ id - 1 ] > threshold[ id - 1 ] );
+					if(page_len < 188) {
+						usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, page_len, 0);
+						usb_fifo_put_data( sc_fifo_open[id - 1], pc, *offset + page_len, 188-page_len, lastflag );
+					}
+					else {
+						usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, 188, lastflag);
+					}
+					if(lastflag)
+						packets[ id - 1 ]= 0;
+					else
+						packets[ id - 1 ]++;
 				}
 				else {
-					usb_fifo_put_data_linear( sc_fifo_open[id - 1], p, 188, lastflag);
+					pr_debug("%s:fifo[%d] has no space\n",__FUNCTION__, id - 1);
 				}
-			}
-			else {
-				pr_debug("%s:sc_fifo_open[%d] is NULL\n",__FUNCTION__, id-1 );
 			}
 		} else {
 			pr_debug("px4_ts_write: unknown id %d\n", id);
@@ -719,6 +739,8 @@ static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
 	struct px4_stream_context *stream_context = context;
 	u8 *context_remain_buf = stream_context->remain_buf;
 	u32 context_remain_len = stream_context->remain_len;
+	size_t* packets = stream_context->number_of_packets;
+	size_t* threshold = stream_context->threshold_packet_size;
 	u32 remain = len;
 	usb_frlength_t offset=0;
 	bool sync_remain = false;
@@ -733,7 +755,7 @@ static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
 			context_remain_len = TS_SYNC_SIZE;
 
 			if (px4_ts_sync(&context_remain_buf, &context_remain_len, &sync_remain)) {
-				px4_ts_write(stream_context->sc_fifo_open, &context_remain_buf, &context_remain_len);
+				px4_ts_write(stream_context->sc_fifo_open, &context_remain_buf, &context_remain_len, packets, threshold);
 
 				offset += l;
 				remain -= l;
@@ -752,7 +774,7 @@ static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
 		if (!px4_ts_sync_with_page_cache( pc, &offset, &remain, &sync_remain))
 			break;
 
-		px4_ts_write_with_page_cache(stream_context->sc_fifo_open, pc, &offset, &remain);
+		px4_ts_write_with_page_cache(stream_context->sc_fifo_open, pc, &offset, &remain, packets, threshold);
 	}
 
 	if (sync_remain) {
@@ -975,7 +997,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tuner_locked)
 				break;
 
+			mtx_unlock( &px4->lock );
 			pause( NULL, MSEC_2_TICKS( 10 ));
+			mtx_lock( &px4->lock );
 		}
 
 		if (ret) {
@@ -1006,7 +1030,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && demod_locked)
 				break;
 
+			mtx_unlock( &px4->lock );
 			pause( NULL, MSEC_2_TICKS( 10 ) );
+			mtx_lock( &px4->lock );
 		}
 
 		if (ret) {
@@ -1029,7 +1055,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if ((!ret && tsid) || ret == -EINVAL)
 				break;
 
+			mtx_unlock( &px4->lock );
 			pause( NULL, MSEC_2_TICKS( 10 ) );
+			mtx_lock( &px4->lock );
 		}
 
 		if (ret) {
@@ -1058,7 +1086,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tsid2 == tsid)
 				break;
 
+			mtx_unlock( &px4->lock );
 			pause( NULL, MSEC_2_TICKS( 10 ) );
+			mtx_lock( &px4->lock );
 		}
 
 		dev_dbg(px4->dev, "px4_tsdev_set_channel %d:%u: tc90522_get_tsid_s() tsid2: 0x%04x, count: %d\n", dev_idx, tsdev_id, tsid2, i);
@@ -1123,7 +1153,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tuner_locked)
 				break;
 
+			mtx_unlock( &px4->lock );
 			pause( NULL, MSEC_2_TICKS( 10 ) );
+			mtx_lock( &px4->lock );
 		}
 
 		if (ret) {
@@ -1161,14 +1193,20 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 		}
 
 		// check lock
+		dev_dbg(px4->dev,"tc90522_is_signal_locked_s\n");
 
-		i = 300;
+		i = 60;
 		while (i--) {
 			ret = tc90522_is_signal_locked_t(tc90522, &demod_locked);
 			if (!ret && demod_locked)
 				break;
+			if( (i % 100)== 0 ){
+				dev_dbg(px4->dev,"%s:i=%d\n",__FUNCTION__, i);
+			}
 
-			pause( NULL, MSEC_2_TICKS( 10 ) );
+			mtx_unlock( &px4->lock );
+			pause( NULL, MSEC_2_TICKS( 50 ) );
+			mtx_lock( &px4->lock );
 		}
 
 		if (ret) {
@@ -1183,8 +1221,11 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			break;
 		}
 
-		if (i > 265)
-			pause( NULL, MSEC_2_TICKS( (i - 265) * 10 ) );
+		if (i > 53){
+			mtx_unlock( &px4->lock );
+			pause( NULL, MSEC_2_TICKS( (i - 53) * 50 ) );
+			mtx_lock( &px4->lock );
+		}
 
 		break;
 	}
@@ -1251,7 +1292,7 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 #if defined(__FreeBSD__)
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: urb_buffer_size: %u, urb_num: %u, no_dma: %c\n", px4->dev_idx, tsdev->id, bus->usb.streaming_usb_buffer_size, bus->usb.streaming_urb_num, (bus->usb.streaming_no_dma) ? 'Y' : 'N');
 		
-		usbd_transfer_stop( bus->usb.transfer[ IT930X_BUS_BULK_STREAM_RD ] );
+		usbd_transfer_stop( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 		
 #else		
 		bus->usb.streaming_urb_buffer_size = 188 * urb_max_packets;
@@ -1268,9 +1309,13 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 #endif
 	}
 
-	//ringbuffer_size = 188 * tsdev_max_packets;
-	//dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: size of ringbuffer: %u\n", px4->dev_idx, tsdev->id, ringbuffer_size);
-
+#if !defined(__FreeBSD__)
+	ringbuffer_size = 188 * tsdev_max_packets;
+	dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: size of ringbuffer: %u\n", px4->dev_idx, tsdev->id, ringbuffer_size);
+#else
+	mtx_unlock( &px4->it930x.bus.usb.stream_mtx);
+#endif
+	
 	switch (tsdev->isdb) {
 	case ISDB_S:
 		// enable ts pins
@@ -1298,7 +1343,10 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		ret = -EIO;
 		break;
 	}
-
+#if defined(__FreeBSD__)
+	mtx_lock( &px4->it930x.bus.usb.stream_mtx);
+#endif
+	
 	if (ret)
 		goto fail;
 
@@ -1351,19 +1399,6 @@ fail:
 	
 	return ret;
 }
-static void px4_tsdev_start_read( struct usb_fifo *fifo )
-{
-	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4 = tsdev->parent;
-	int error;
-
-	error = px4_tsdev_start_streaming( tsdev );
-	if(error){
-		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
-	}
-	
-	return;
-}
 
 static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 {
@@ -1378,6 +1413,7 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 
 	atomic_set(&tsdev->streaming, 0);
 
+	dev_dbg(px4->dev, "px4_tsdev_stop_streaming: waiting px4->lock\n");
 	mutex_lock(&px4->lock);
 
 	px4->streaming_count--;
@@ -1396,14 +1432,21 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 	}
 	streaming_count = px4->streaming_count;
 
+#if defined(__FreeBSD__)
+	if (!avail){
+		mutex_unlock(&px4->lock);
+		return 0;
+	}
+
+	mtx_unlock( &px4->it930x.bus.usb.stream_mtx);
+#else	
 	mutex_unlock(&px4->lock);
 
-#if !defined(__FreeBSD__)
 	ringbuffer_stop(tsdev->ringbuf);
-#endif
-	
+
 	if (!avail)
 		return 0;
+#endif
 
 	switch (tsdev->isdb) {
 	case ISDB_S:
@@ -1420,26 +1463,14 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 		ret = -EIO;
 		break;
 	}
-
+#if defined(__FreeBSD__)
+	mtx_lock( &px4->it930x.bus.usb.stream_mtx);
+	mtx_unlock( &px4->lock);
+#endif
+	
 	dev_dbg(px4->dev, "px4_tsdev_stop_streaming %d:%u: streaming_count: %u\n", px4->dev_idx, tsdev->id, streaming_count);
 	
 	return ret;
-}
-static void px4_tsdev_stop_read( struct usb_fifo *fifo )
-{
-	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4 = tsdev->parent;
-	atomic_t avail;
-	int error;
-
-	atomic_read( &avail );
-
-	error = px4_tsdev_stop_streaming( tsdev, avail );
-	if(error){
-		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
-	}
-	
-	return;
 }
 
 static int px4_tsdev_get_cn(struct px4_tsdev *tsdev, u32 *cn)
@@ -1579,9 +1610,11 @@ static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS)
 	
 	freq.freq_no = (val & 0xffff);
 	freq.slot = ((val >> 16)& 0xffff);
-	
+
+	mtx_lock(&px4->lock);
 	error = px4_tsdev_set_channel( tsdev, &freq );
-	dev_dbg(px4->dev, "px4_sysctl_freq:error=%d\n", error);	
+	mtx_unlock(&px4->lock);
+	
 	return error;
 }
 
@@ -1748,7 +1781,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	}
 
 	error = usb_fifo_alloc_buffer( fifo,
-								   usbd_xfer_max_len( bus->usb.transfer[ IT930X_BUS_BULK_STREAM_RD ] ),
+								   usbd_xfer_max_len( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] ),
 								   tsdev_max_packets );
 	if ( error ) {
 	  ret= ENOMEM;
@@ -1757,6 +1790,8 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	
 	tsdev->sc_fifo_open = fifo;
 	px4->stream_context->sc_fifo_open[ tsdev_id ]= fifo;
+	px4->stream_context->number_of_packets[ tsdev_id ]= 0;
+	px4->stream_context->threshold_packet_size[ tsdev_id ]= tsdev_max_packets/10;
 	
 	tsdev->open = true;
 
@@ -1779,6 +1814,7 @@ fail:
 
 	return ret;
 }
+
 
 static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 {
@@ -1803,7 +1839,7 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	if (avail && tsdev->isdb == ISDB_S)
 		px4_tsdev_set_lnb_power(tsdev, false);
 	
-	
+
 	if ( tsdev->open ){
 		tsdev->sc_fifo_open = NULL;
 		px4->stream_context->sc_fifo_open[ tsdev_id ]= NULL;
@@ -1833,6 +1869,43 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	dev_dbg(px4->dev, "px4_tsdev_release %d:%u: ok. ref count: %d\n", px4->dev_idx, tsdev->id, ref);
 
   return ;
+}
+
+static void px4_tsdev_start_read( struct usb_fifo *fifo )
+{
+	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
+	struct px4_softc *px4 = tsdev->parent;
+	int error;
+
+	error = px4_tsdev_start_streaming( tsdev );
+	if(error){
+		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+	}
+	
+	return;
+}
+
+static void px4_tsdev_stop_read( struct usb_fifo *fifo )
+{
+	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
+	struct px4_softc *px4 = tsdev->parent;
+	atomic_t avail;
+	int error;
+
+	avail = atomic_read(&px4->avail);
+	
+	dev_dbg(px4->dev, "px4_tsdev_stop_read %d:%u: avail: %d\n", px4->dev_idx, tsdev->id, avail);
+	
+	error = px4_tsdev_stop_streaming(tsdev, (avail) ? true : false);
+	if(error){
+		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+	}
+	
+	if (avail && tsdev->isdb == ISDB_S)
+		px4_tsdev_set_lnb_power(tsdev, false);
+	
+
+	return;
 }
 
 #if 0
@@ -2229,9 +2302,9 @@ static int px4_attach(device_t dev)
 	for( i = 0; i < TSDEV_NUM; i++ ){
 		px4->tsdev[ i ].parent = px4;
 		px4_fifo_methods.postfix[0]= i/2 ? "t": "s";
-		
+
 		error= usb_fifo_attach( uaa->device, &px4->tsdev[ i ],
-								&px4->lock,
+								&bus->usb.stream_mtx,
 								&px4_fifo_methods, &px4->sc_fifo[ i ], dev_idx, i,
 								iface_index, UID_ROOT, GID_OPERATOR, 0666);
     
