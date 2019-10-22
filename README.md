@@ -1,12 +1,15 @@
-# fbsdpx4 - Unofficial FreeBSD driver for PLEX PX-W3U4/Q3U4/W3PE4/Q3PE4 ISDB-T/S receivers
+# fbsdpx4 - FreeBSD driver for PLEX PX-W3U4/Q3U4/W3PE4/Q3PE4 ISDB-T/S receivers
 
 FreeNASで録画サーバーを運用したいためにPLEX PX-W3U4/Q3U4/W3PE4/Q3PE4用の非公式版Linuxドライバをfbsdpt3を参考にFreeBSDに移植してみました。  
 [非公式版Linuxドライバ](https://github.com/nns779/px4_drv)のv0.2.1aをベースにしています。  
 
 Kernel Panicが発生する可能性があります。  
 BSがないので、PX-W3U4/W3PE4相当のデバイスに地上波2channelの多重でMirakurun/Chinachu動作確認中。  
-10msのpauseではmtx_lockが奪えないみたいで、  
-channel変更中にもう一方のdevがcloseされるとsuできない状態に...  
+~~10msのpauseではmtx_lockが奪えないみたいで、~~  
+~~channel変更中にもう一方のdevがcloseされるとsuできない状態に...~~  
+tc90522_is_signal_locked_t関数を10msで実施するUSBの通信が停止するので100msに変更。
+mutexの場合、USB制御中にDeadlock判定になるので、sxlockを追加。
+1channelだとdropが発生しないけれど、2channel目の制御することでdropが発生している感じ。  
 また、Mirakurun動作中にデバイスロードするとKernel Panic発生します。  
 
 ## 対応デバイス
