@@ -14,30 +14,54 @@
 #undef IT930X_BUS_USE_WORKQUEUE
 #endif
 
+extern unsigned int px4_debug;
 
 #define kzalloc(A,B) malloc(A,M_DEVBUF,M_NOWAIT)
 #define kmalloc(A,B) malloc(A,M_DEVBUF,M_NOWAIT)
 #define vfree(A) free(A,M_DEVBUF)
 #define kfree(A) free(A,M_DEVBUF)
 #define container_of(ptr, type, member) ({                      \
-      __typeof( ((type *)0)->member ) *__mptr = (ptr);		\
-      (type *)( (char *)__mptr - offsetof(type,member) );})
+			__typeof( ((type *)0)->member ) *__mptr = (ptr);		\
+			(type *)( (char *)__mptr - offsetof(type,member) );})
 
-#ifdef DEBUG
-#define dev_dbg(dev,fmt,...) device_printf(dev,"DEBUG:" fmt, ##__VA_ARGS__)
-#define pr_debug(fmt,...) printf(fmt, ##__VA_ARGS__)
-#else
-#define dev_dbg(dev,fmt,...)
-#define pr_debug(fmt,...)
-#endif
+#define dev_dbg(dev,fmt,...) do {							\
+		if( px4_debug >= 7) {								\
+			device_printf(dev,"DEBUG:" fmt, ##__VA_ARGS__); \
+		}													\
+	} while(0)
 
-#define dev_err(dev,fmt,...)  device_printf(dev,"ERROR:" fmt, ##__VA_ARGS__)
+#define pr_debug(fmt,...) do {					\
+		if( px4_debug >= 7 ) {					\
+			printf(fmt, ##__VA_ARGS__);			\
+		}										\
+	} while(0)
 
-#define dev_warn(dev,fmt,...)  device_printf(dev,"WARNING:" fmt, ##__VA_ARGS__)
-#define dev_info(dev,fmt,...)  device_printf(dev,"INFO:" fmt, ##__VA_ARGS__)
-#define pr_err(fmt,...) printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__)
+	
+#define dev_err(dev,fmt,...)  do {							\
+		if( px4_debug >= 3 ) {								\
+			device_printf(dev,"ERROR:" fmt, ##__VA_ARGS__);	\
+		}													\
+	} while(0)	
 
 
+#define dev_warn(dev,fmt,...) do {								\
+		if( px4_debug >= 4 ) {									\
+			device_printf(dev,"WARNING:" fmt, ##__VA_ARGS__);	\
+		}														\
+	} while(0)
+	  
+#define dev_info(dev,fmt,...) do {										\
+		if( px4_debug >= 6 ) {											\
+			device_printf(dev,"INFO:" fmt, ##__VA_ARGS__);				\
+		}																\
+	} while(0)
+
+#define pr_err(fmt,...) do {								\
+		if( px4_debug >= 3 ) {								\
+			printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__);	\
+		}													\
+	} while(0)
+	  
 #define mutex_init(A)		mtx_init(A, "px4" , #A, MTX_DEF)
 #define mutex_lock(A)		mtx_lock(A)
 #define mutex_unlock(A)		mtx_unlock(A)

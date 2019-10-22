@@ -95,7 +95,6 @@ struct it930x_bus {
 			struct cv xfer_cv;
 			struct mtx xfer_mtx;
 			struct mtx stream_mtx;
-			struct mtx *px4_lock;
 			u32 event;
 			bool (*fifos_put_bytes_max)(void *context);
 #endif

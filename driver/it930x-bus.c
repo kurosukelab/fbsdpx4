@@ -811,7 +811,7 @@ int it930x_bus_init(struct it930x_bus *bus)
 				bus->usb.discard_packets = IT930X_BUS_DISCARD_PACKETS;
 				
 				it930x_stream_config[IT930X_BUS_STREAM_RD].bufsize = bus->usb.streaming_usb_buffer_size;
-
+				
 				error = usbd_transfer_setup( bus->usb.dev, &bus->usb.iface_index,
 											 bus->usb.ctrl_transfer, it930x_ctrl_config, IT930X_BUS_CTRL_N_TRANSFER, bus,
 											 &bus->usb.xfer_mtx );
@@ -829,6 +829,7 @@ int it930x_bus_init(struct it930x_bus *bus)
 					ret = -ENOMEM;
 					break;
 				}
+				dev_dbg(bus->dev, "%s:stream bufsize=%d\n", __FUNCTION__, it930x_stream_config[IT930X_BUS_STREAM_RD].bufsize);
 
 				usbd_xfer_set_priv( bus->usb.ctrl_transfer[ IT930X_BUS_CTRL_WR ], &bus->usb.xfer_tx_head );
 				usbd_xfer_set_priv( bus->usb.ctrl_transfer[ IT930X_BUS_CTRL_RD ], &bus->usb.xfer_rx_head );
