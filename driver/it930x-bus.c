@@ -131,7 +131,7 @@ void it930x_usb_ctrl_tx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 	case USB_ST_TRANSFERRED:
 		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
 		bus->usb.event |= IT930X_BUS_TRANSFERRED;
-		//break;
+		break;
 	case USB_ST_SETUP:
 	tr_setup:
 		cb = TAILQ_FIRST( &bus->usb.cmd_tx_buf_pending );
@@ -175,25 +175,28 @@ void it930x_usb_ctrl_rx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 	
 	switch (USB_GET_STATE(transfer)) {
 	case USB_ST_TRANSFERRED:
-		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
-		bus->usb.event |= IT930X_BUS_TRANSFERRED;
+		if( actual > 0 ) {
+			TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
+			bus->usb.event |= IT930X_BUS_TRANSFERRED;
+			break;
+		}
+		else {
+			dev_dbg(bus->dev, "%s:zero length\n", __FUNCTION__);
+		}
 		//break;
 	case USB_ST_SETUP:
 	tr_setup:
 		cb = TAILQ_FIRST( &bus->usb.cmd_rx_buf_pending );
-		if(cb == NULL){
-			cv_signal(&bus->usb.xfer_cv);
-			return;
+		if(cb != NULL){
+			TAILQ_REMOVE( &bus->usb.cmd_rx_buf_pending, cb, entry );
+			TAILQ_INSERT_TAIL( phead, cb, entry );
 		}
-		
-		TAILQ_REMOVE( &bus->usb.cmd_rx_buf_pending, cb, entry );
-		TAILQ_INSERT_TAIL( phead, cb, entry );
 
 		max = usbd_xfer_max_len( transfer );
 		usbd_xfer_set_frame_len( transfer, 0, max );
 		usbd_transfer_submit(transfer);
-		
-		break;
+
+		return;
 	default:
 		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
 		if( error != USB_ERR_CANCELLED ){
@@ -202,6 +205,7 @@ void it930x_usb_ctrl_rx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 			goto tr_setup;
 		}
 		bus->usb.event = -1;
+		dev_dbg(bus->dev, "%s:cancelled\n", __FUNCTION__);
 		break;
 	}
 	cv_signal(&bus->usb.xfer_cv);
