@@ -43,6 +43,11 @@ extern unsigned int px4_debug;
 		}													\
 	} while(0)	
 
+#define pr_err(fmt,...) do {								\
+		if( px4_debug >= 3 ) {								\
+			printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__);	\
+		}													\
+	} while(0)
 
 #define dev_warn(dev,fmt,...) do {								\
 		if( px4_debug >= 4 ) {									\
@@ -56,11 +61,12 @@ extern unsigned int px4_debug;
 		}																\
 	} while(0)
 
-#define pr_err(fmt,...) do {								\
-		if( px4_debug >= 3 ) {								\
+#define pr_info(fmt,...) do {								\
+		if( px4_debug >= 6 ) {								\
 			printf("%s: " fmt,__FUNCTION__, ##__VA_ARGS__);	\
 		}													\
 	} while(0)
+
 	  
 #define mutex_init(A)		mtx_init(A, "px4" , #A, MTX_DEF)
 #define mutex_lock(A)		mtx_lock(A)

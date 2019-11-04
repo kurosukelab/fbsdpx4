@@ -8,6 +8,7 @@ BSがないので、PX-W3U4/W3PE4相当のデバイスに地上波2channelの多
 ~~tc90522_is_signal_locked_t関数を10msで実施するUSBの通信が停止するので100msに変更。~~sxlockで排他することで10msに戻す。  
 mutexの場合、USB制御中にDeadlock判定になるので、sxlockを追加。  
 深夜に停波するとsignal lockできずにstreamを止めてしまうので,別のmutexを追加。排他制御をやり直し...  
+px4のlockをsx_lockに置き換え。  
 1channelだとdropが発生しないけれど、2channel目の制御することでdropが発生している感じ。  
 また、Mirakurun動作中にデバイスロードするとKernel Panic発生します。  
 

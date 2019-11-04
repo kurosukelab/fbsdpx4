@@ -35,7 +35,7 @@
 
 #include "px4.h"
 #include "fbsdpx4.h"
-//#include "revision.h"
+#include "revision.h"
 #include "ptx_ioctl.h"
 #include "i2c_comm.h"
 #include "it930x-config.h"
@@ -103,7 +103,7 @@ struct px4_multi_device;
 struct px4_softc {
 	device_t dev;	
 	struct usb_device *usbdev;
-	struct mtx lock;
+	//struct mtx lock;
 	struct sx xlock;
 	struct usb_callout sc_watchdog;
 	uint8_t sc_iface_num;
@@ -291,7 +291,7 @@ static int px4_init(struct px4_softc *px4)
 	mutex_init(&px4->wait_mtx);
 	//init_waitqueue_head(&px4->wait);
 	
-	mtx_init(&px4->lock, "px4", "px4->lock", MTX_DEF | MTX_RECURSE );
+	//mtx_init(&px4->lock, "px4", "px4->lock", MTX_DEF | MTX_RECURSE );
 	sx_init(&px4->xlock, "px4->xlock");
 	//usb_callout_init_mtx(&px4->sc_watchdog, &px4->lock, 0 );
 	
@@ -333,7 +333,7 @@ static int px4_term(struct px4_softc *px4)
 	
 	cv_destroy( &px4->wait_cv );
 	mtx_destroy( &px4->wait_mtx );
-	mtx_destroy( &px4->lock);
+	//mtx_destroy( &px4->lock);
 	sx_destroy( &px4->xlock);
 	
 	return 0;
@@ -1291,8 +1291,9 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 
 #if defined(__FreeBSD__)
 	sx_xlock( &px4->xlock);
-#endif
+#else
 	mutex_lock(&px4->lock);
+#endif
 
 	if (!px4->streaming_count) {
 		
@@ -1371,13 +1372,8 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		px4->stream_context->remain_len = 0;
 
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: starting...\n", px4->dev_idx, tsdev->id);
-#if defined(__FreeBSD__)
-		mtx_lock( &px4->it930x.bus.usb.stream_mtx );
-#endif
 		ret = it930x_bus_start_streaming(bus, px4_on_stream, px4->stream_context);
-#if defined(__FreeBSD__)
-		mtx_unlock( &px4->it930x.bus.usb.stream_mtx );
-#endif
+
 		if (ret) {
 			dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: it930x_bus_start_streaming() failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
 			goto fail_after_ringbuffer;
@@ -1397,9 +1393,10 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 	px4->streaming_count++;
 	streaming_count = px4->streaming_count;
 
-	mutex_unlock(&px4->lock);
 #if defined(__FreeBSD__)
 	sx_xunlock( &px4->xlock);
+#else
+	mutex_unlock(&px4->lock);
 #endif
 	
 	dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: streaming_count: %u\n", px4->dev_idx, tsdev->id, streaming_count);
@@ -1408,11 +1405,12 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 fail_after_ringbuffer:
 	//	ringbuffer_stop(tsdev->ringbuf);
 fail:
-	mutex_unlock(&px4->lock);
-	atomic_set(&tsdev->streaming, 0);
 #if defined(__FreeBSD__)
 	sx_xunlock( &px4->xlock);
+#else
+	mutex_unlock(&px4->lock);
 #endif
+	atomic_set(&tsdev->streaming, 0);
 
 	dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
 	
@@ -1434,19 +1432,14 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 
 #if defined(__FreeBSD__)
 	sx_xlock(&px4->xlock);
-#endif
+#else
 	mutex_lock(&px4->lock);
+#endif
 
 	px4->streaming_count--;
 	if (!px4->streaming_count) {
 		dev_dbg(px4->dev, "px4_tsdev_stop_streaming %d:%u: stopping...\n", px4->dev_idx, tsdev->id);
-#if defined(__FreeBSD__)
-		mtx_lock( &px4->it930x.bus.usb.stream_mtx );
-#endif
 		it930x_bus_stop_streaming(&px4->it930x.bus);
-#if defined(__FreeBSD__)
-		mtx_unlock( &px4->it930x.bus.usb.stream_mtx );
-#endif
 
 #ifdef PSB_DEBUG
 		if (px4->wq) {
@@ -1459,9 +1452,9 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 	}
 	streaming_count = px4->streaming_count;
 
+#if !defined(__FreeBSD__)
 	mutex_unlock(&px4->lock);
 
-#if !defined(__FreeBSD__)
 	ringbuffer_stop(tsdev->ringbuf);
 #endif
 	
@@ -1501,12 +1494,8 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 static int px4_tsdev_get_cn(struct px4_tsdev *tsdev, u32 *cn)
 {
 	int ret = 0;
-	struct px4_softc *px4 = tsdev->parent;
 	struct tc90522_demod *tc90522 = &tsdev->tc90522;
 
-#if defined(__FreeBSD__)
-	sx_xlock( &px4->xlock );
-#endif
 	switch (tsdev->isdb) {
 	case ISDB_S:
 		ret = tc90522_get_cn_s(tc90522, (u16 *)cn);
@@ -1520,9 +1509,6 @@ static int px4_tsdev_get_cn(struct px4_tsdev *tsdev, u32 *cn)
 		ret = -EIO;
 		break;
 	}
-#if defined(__FreeBSD__)
-	sx_xunlock( &px4->xlock);
-#endif
 
 	return ret;
 }
@@ -1535,7 +1521,11 @@ static int px4_tsdev_set_lnb_power(struct px4_tsdev *tsdev, bool enable)
 	if ((tsdev->lnb_power && enable) || (!tsdev->lnb_power && !enable))
 		return 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock( &px4->xlock );
+#else
 	mutex_lock(&px4->lock);
+#endif
 
 	if (enable) {
 		if (!px4->lnb_power_count)
@@ -1549,7 +1539,11 @@ static int px4_tsdev_set_lnb_power(struct px4_tsdev *tsdev, bool enable)
 		px4->lnb_power_count--;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xunlock( &px4->xlock);
+#else
 	mutex_unlock(&px4->lock);
+#endif
 
 	tsdev->lnb_power = enable;
 
@@ -1686,8 +1680,14 @@ static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS)
 	if(req->newptr){
 		return EPERM;
 	}
-	
+
+#if defined(__FreeBSD__)
+	sx_xlock( &px4->xlock );
+#endif
 	error = px4_tsdev_get_cn(tsdev, (u32 *)&cn);
+#if defined(__FreeBSD__)
+	sx_xunlock( &px4->xlock);
+#endif
 	if( error ){
 		return error;
 	}
@@ -1717,12 +1717,18 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	unsigned int tsdev_id = tsdev->id;
 	int error;
 	unsigned int bufsize;
-	
+
+#if defined(__FreeBSD__)
+	sx_xlock(&px4->xlock);
+#endif
 	mutex_lock(&glock);
 	
 	if (!atomic_read(&px4->avail)) {
 		// not available
 		mutex_unlock(&glock);
+#if defined(__FreeBSD__)
+		sx_xunlock(&px4->xlock);
+#endif
 		return -EIO;
 	}
 	
@@ -1738,12 +1744,16 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 		goto fail;
 	}
 	
+#if !defined(__FreeBSD__)
 	mutex_lock(&px4->lock);
+#endif
 	
 	ref = px4_ref(px4);
 	if (ref <= 1) {
 		ret = -ECANCELED;
+#if !defined(__FreeBSD__)
 		mutex_unlock(&px4->lock);
+#endif
 		mutex_unlock(&tsdev->lock);
 		goto fail;
 	}
@@ -1847,8 +1857,13 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	
 	tsdev->open = true;
 
+#if !defined(__FreeBSD__)
 	mutex_unlock(&px4->lock);
+#endif
 	mutex_unlock(&tsdev->lock);
+#if defined(__FreeBSD__)
+	sx_xunlock(&px4->xlock);
+#endif
 
 	dev_dbg(px4->dev, "px4_tsdev_open %d:%u: ok\n", dev_idx, tsdev_id);
 
@@ -1859,9 +1874,14 @@ fail_after_power:
 		px4_set_power(px4, false);
 fail_after_ref:
 	px4_unref(px4);
+#if !defined(__FreeBSD__)
 	mutex_unlock(&px4->lock);
+#endif
 	mutex_unlock(&tsdev->lock);
 fail:
+#if defined(__FreeBSD__)
+	sx_xunlock(&px4->xlock);
+#endif
 	dev_err(px4->dev, "px4_tsdev_open %d:%u: failed. (ret: %d)\n", dev_idx, tsdev_id, ret);
 
 	return ret;
@@ -1898,8 +1918,9 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	
 #if defined(__FreeBSD__)
 	sx_xlock(&px4->xlock);
-#endif	
+#else
  	mutex_lock(&px4->lock);
+#endif	
 	
 	if (avail)
 		px4_tsdev_term(tsdev);
@@ -1908,7 +1929,9 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	if (avail && ref <= 1)
 		px4_set_power(px4, false);
 	
+#if !defined(__FreeBSD__)
 	mutex_unlock(&px4->lock);
+#endif
 	
 	tsdev->open = false;
 	
@@ -2110,6 +2133,27 @@ static int px4_probe(device_t dev)
 		(uaa->info.bInterfaceClass == UICLASS_VENDOR ) &&
 		(uaa->info.bInterfaceSubClass == 0 ) &&
 		(uaa->info.bInterfaceProtocol == 0 )){
+		
+		pr_info( DEVICE_NAME
+#ifdef PX4_DRIVER_VERSION
+				" version " PX4_DRIVER_VERSION
+#endif
+#ifdef REVISION_NUMBER
+#if defined(PX4_DRIVER_VERSION)
+				","
+#endif
+				" rev: " REVISION_NUMBER
+#endif
+#ifdef COMMIT_HASH
+#if defined(PX4_DRIVER_VERSION) || defined(REVISION_NUMBER)
+				","
+#endif
+				" commit: " COMMIT_HASH
+#endif
+#ifdef REVISION_NAME
+				" @ " REVISION_NAME
+#endif
+				"\n");
 		
 		return BUS_PROBE_SPECIFIC;
 	}
@@ -2425,7 +2469,11 @@ static int px4_detach(device_t dev)
 	dev_dbg(px4->dev, "px4_disconnect: dev_idx: %d\n", px4->dev_idx);
 
 	atomic_set(&px4->avail, 0);
+#if defined(__FreeBSD__)
+	sx_xlock( &px4->xlock );
+#else
 	mutex_lock(&px4->lock);
+#endif
 
 	//usb_callout_stop( &px4->sc_watchdog );
 	
@@ -2441,7 +2489,11 @@ static int px4_detach(device_t dev)
 
 	ref = px4_unref(px4);
 
+#if defined(__FreeBSD__)
+	sx_xunlock( &px4->xlock );
+#else
 	mutex_unlock(&px4->lock);
+#endif
 
 	for (i = 0; i < TSDEV_NUM; i++) {
 		struct px4_tsdev *tsdev = &px4->tsdev[i];
