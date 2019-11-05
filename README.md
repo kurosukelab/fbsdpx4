@@ -11,7 +11,8 @@ sxlockで排他制御することで10msに戻す。
 深夜に停波するとsignal lockできずにstreamを止めてしまうので,別のmutexを追加。排他制御をやり直し...  
 px4のlockをsx_lockに置き換え。  
 1channelだとdropが発生しないけれど、2channel目の制御することでdropが発生している感じ。  
-また、Mirakurun動作中にデバイスロードするとKernel Panic発生します。  
+~~また、Mirakurun動作中にデバイスロードするとKernel Panic発生します。~~  
+glockをmutexからsxloadに修正し、Mirakurun動作中のmodule load/unloadによるKerenl Panicを回避。  
 
 ## 対応デバイス
 

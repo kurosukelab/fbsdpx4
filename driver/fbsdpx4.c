@@ -147,9 +147,8 @@ static usb_fifo_close_t px4_tsdev_release;
 static usb_fifo_cmd_t px4_tsdev_start_read;
 static usb_fifo_cmd_t px4_tsdev_stop_read;
 
-static atomic_t gcount = 0;
-static struct mtx glock;
-//static DEFINE_MUTEX(glock);
+static struct sx glock;
+SX_SYSINIT(px4_lock, &glock, "px4 global lock");
 //static struct class *px4_class = NULL;
 //static dev_t px4_dev_first;
 static struct px4_softc *devs[ MAX_DEVICE ];
@@ -663,7 +662,7 @@ static void px4_ts_write(struct px4_tsdev **ptsdev, u32 *valid_tsdev, u8 **buf, 
 				}
 				else {
 					if( ( tsdev->no_space_count % FIFO_NO_SPACE_PROHIBIT) == 0 ){
-						pr_debug("%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
+						dev_dbg( tsdev->parent->dev,"%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
 					}
 					tsdev->no_space_count++;
 				}
@@ -713,7 +712,7 @@ static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, u32 *valid_t
 				}
 				else {
 					if( ( tsdev->no_space_count % FIFO_NO_SPACE_PROHIBIT) == 0 ){
-						pr_debug("%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
+						dev_dbg( tsdev->parent->dev, "%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
 					}
 					tsdev->no_space_count++;
 				}
@@ -1720,14 +1719,17 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 
 #if defined(__FreeBSD__)
 	sx_xlock(&px4->xlock);
-#endif
+	sx_xlock(&glock);
+#else
 	mutex_lock(&glock);
-	
+#endif	
 	if (!atomic_read(&px4->avail)) {
 		// not available
-		mutex_unlock(&glock);
 #if defined(__FreeBSD__)
+		sx_xunlock(&glock);
 		sx_xunlock(&px4->xlock);
+#else
+		mutex_unlock(&glock);
 #endif
 		return -EIO;
 	}
@@ -1735,7 +1737,11 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	tsdev = &px4->tsdev[tsdev_id];
 	
 	mutex_lock(&tsdev->lock);
+#if defined(__FreeBSD__)
+	sx_xunlock(&glock);
+#else
 	mutex_unlock(&glock);
+#endif
 	
 	if (tsdev->open) {
 		// already used by another
@@ -1900,7 +1906,9 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	}
 	
 	avail = atomic_read(&px4->avail);
-	
+
+	if( tsdev->no_space_count )
+		dev_dbg(px4->dev, "px4_tsdev_release %d:%u: no space count= %u\n", px4->dev_idx, tsdev->id, tsdev->no_space_count);
 	dev_dbg(px4->dev, "px4_tsdev_release %d:%u: avail: %d\n", px4->dev_idx, tsdev->id, avail);
 	
 	mutex_lock(&tsdev->lock);
@@ -1945,6 +1953,8 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	mutex_unlock( &px4->wait_mtx );
 	//wake_up(&px4->wait);
   
+	if( tsdev->no_space_count )
+		dev_dbg(px4->dev, "px4_tsdev_release %d:%u: no space count= %u\n", px4->dev_idx, tsdev->id, tsdev->no_space_count);
 	dev_dbg(px4->dev, "px4_tsdev_release %d:%u: ok. ref count: %d\n", px4->dev_idx, tsdev->id, ref);
 
   return ;
@@ -2179,13 +2189,11 @@ static int px4_attach(device_t dev)
 	
 	dev_dbg(dev, "px4_attach: xfer_packets: %u\n", xfer_packets);
 	
-	if( !atomic_read(&gcount) ) {
-		atomic_add(1, &gcount);
-		mutex_init( &glock );
-		dev_dbg(dev, "px4_attach: initialized glock\n");
-	}
-	
+#if defined(__FreeBSD__)
+	sx_xlock(&glock);
+#else
 	mutex_lock(&glock);
+#endif
 	
 	dev_idx = device_get_unit(dev);
 	
@@ -2416,8 +2424,12 @@ static int px4_attach(device_t dev)
 	//mutex_lock( &px4->lock );
 	//px4_watchdog_reset( px4 );
 	//mutex_unlock( &px4->lock );
-	
+
+#if defined(__FreeBSD__)
+	sx_xunlock(&glock);
+#else
 	mutex_unlock(&glock);
+#endif
 	
 	return 0;
 
@@ -2453,7 +2465,11 @@ static int px4_attach(device_t dev)
 			kfree(px4->stream_context);
 	}
 	
+#if defined(__FreeBSD__)
+	sx_xunlock(&glock);
+#else
 	mutex_unlock(&glock);
+#endif
 
 	return ret;
 }
@@ -2477,7 +2493,11 @@ static int px4_detach(device_t dev)
 
 	//usb_callout_stop( &px4->sc_watchdog );
 	
+#if defined(__FreeBSD__)
+	sx_xlock(&glock);
+#else
 	mutex_lock(&glock);
+#endif
 
 	devs[px4->dev_idx] = NULL;
 
@@ -2485,7 +2505,11 @@ static int px4_detach(device_t dev)
 	for (i = 0; i < TSDEV_NUM; i++)
 		usb_fifo_detach( &px4->sc_fifo[i]);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&glock);
+#else
 	mutex_unlock(&glock);
+#endif
 
 	ref = px4_unref(px4);
 
@@ -2510,7 +2534,11 @@ static int px4_detach(device_t dev)
 	}
 	mutex_unlock( &px4->wait_mtx );
 
+#if defined(__FreeBSD__)
+	sx_xlock(&glock);
+#else
 	mutex_lock(&glock);
+#endif
 
 	if (px4->multi_dev) {
 		struct px4_multi_device *multi_dev = px4->multi_dev;
@@ -2528,7 +2556,11 @@ static int px4_detach(device_t dev)
 			mutex_unlock(&multi_dev->lock);
 	}
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&glock);
+#else
 	mutex_unlock(&glock);
+#endif
 
 	// uninitialize
 	it930x_term(&px4->it930x);
