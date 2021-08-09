@@ -337,7 +337,9 @@ int rt710_set_params(struct rt710_tuner *t, u32 freq, u32 symbol_rate, u32 rollo
 
 	if (t->config.loop_through)
 		regs[0x01] &= 0xfb;
-
+	else
+	  regs[0x01] |= 0x04;
+	
 	switch (t->config.agc_mode) {
 	case RT710_AGC_POSITIVE:
 		regs[0x0d] |= 0x10;
@@ -375,11 +377,7 @@ int rt710_set_params(struct rt710_tuner *t, u32 freq, u32 symbol_rate, u32 rollo
 		goto fail;
 	}
 
-#if defined(__FreeBSD__)
-	pause( NULL, MSEC_2_TICKS( 10 ));
-#else
 	msleep(10);
-#endif
 
 	if ((freq - 1600000) >= 350000) {
 		regs[0x02] &= 0xbf;

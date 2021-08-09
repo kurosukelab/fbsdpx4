@@ -24,6 +24,7 @@
 #include <machine/atomic.h>
 
 #include <dev/usb/usb.h>
+#include <dev/usb/usb_dev.h>
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdi_util.h>
 #include <dev/usb/usbhid.h>
@@ -72,9 +73,10 @@
 #define PX4_MAX_DEV 4
 #define FIFO_NO_SPACE_PROHIBIT (500)
 
+#define CONTINUITY_COUNTER_CHCEK
+
 struct px4_tsdev {
-	struct px4_softc *parent;
-	struct mtx lock;
+	struct sx xlock;
 	unsigned int id;
 	int isdb;				// ISDB_T or ISDB_S
 	bool init;
@@ -86,16 +88,31 @@ struct px4_tsdev {
 		struct rt710_tuner rt710;	// for ISDB-S
 	} t;
 	atomic_t streaming;			// 0: not streaming, !0: streaming
+	atomic_t ts_packet_read;
 	struct usb_fifo *sc_fifo_open;
 	int freq;
 	struct mtx fifo_lock;
-	unsigned int no_space_count;
+	unsigned char *stream_buffers;
+	unsigned int  stream_index;
+	unsigned int  stream_max_index;
+	unsigned int  stream_buffer_size;
+	unsigned int  pending_stream_size;
+	
+	unsigned int  discard_ts_packets;
+	unsigned long int ts_packet_count;  // 8byte
+	unsigned int  no_space_count;
+#ifdef CONTINUITY_COUNTER_CHCEK
+	char continuity_counter[0x2000];
+#endif
 };
 
 struct px4_stream_context {
 	struct px4_tsdev *ptsdev[ TSDEV_NUM ];
-	u8 remain_buf[TS_SYNC_SIZE];
+	u8 remain_buf[ 2*TS_SYNC_SIZE ];
 	size_t remain_len;
+	u8 sync_flag;
+	u8 resync_count;
+	
 };
 
 struct px4_multi_device;
@@ -154,13 +171,16 @@ SX_SYSINIT(px4_lock, &glock, "px4 global lock");
 static struct px4_softc *devs[ MAX_DEVICE ];
 static unsigned int xfer_packets = 816;
 static unsigned int usb_max_packets = 816;
-//static unsigned int max_urbs = 6;
+static unsigned int usb_max_mbufs = 6;
 static unsigned int tsdev_max_packets = 2048;
 static bool disable_multi_device_power_control = true;
 static bool s_agc_negative_mode = false;
 static bool s_vga_atten = false;
 static unsigned int s_fine_gain = 3;
-unsigned int px4_debug = 4;
+//unsigned int px4_debug = 4;
+unsigned int px4_debug = 7;
+static unsigned int discard_ts_packets = 1024;
+//static unsigned int discard_ts_packets = 0;
 
 static struct usb_fifo_methods px4_fifo_methods = {
 	.f_open = &px4_tsdev_open,
@@ -172,30 +192,15 @@ static struct usb_fifo_methods px4_fifo_methods = {
 	.postfix[0] = "s"
 };
 
-static void px4_watchdog(void *arg);
-
-static void px4_watchdog_reset(struct px4_softc *px4)
-{
-	usb_callout_reset( &px4->sc_watchdog, hz, &px4_watchdog, px4 );
-}
-
-static void px4_watchdog(void *arg)
-{
-	struct px4_softc *px4 = arg;
-	//static int count=0;
-
-	// get throughput...
-	//printf("count=%d\n", ++count );
-	
-	px4_watchdog_reset( px4 );
-}
-
 static int px4_sysctl_debug(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_tsdev_max_packets(SYSCTL_HANDLER_ARGS);
+static int px4_sysctl_xfer_packets(SYSCTL_HANDLER_ARGS);
+static int px4_sysctl_usb_max_packets(SYSCTL_HANDLER_ARGS);
+static int px4_sysctl_usb_max_mbufs(SYSCTL_HANDLER_ARGS);
+static int px4_sysctl_discard_ts_packets(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS);
-
 
 static void px4_sysctl_init(void *p)
 {
@@ -222,6 +227,22 @@ static void px4_sysctl_init(void *p)
 	SYSCTL_ADD_PROC(scl, sol,
 					OID_AUTO, "tsdev_max_packets",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
 					px4, 0, px4_sysctl_tsdev_max_packets, "I", "TSDEV-Max Packets");
+
+	SYSCTL_ADD_PROC(scl, sol,
+					OID_AUTO, "xfer_packets",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					px4, 0, px4_sysctl_xfer_packets, "I", "Number of transfer packets from the device" );
+
+	SYSCTL_ADD_PROC(scl, sol,
+					OID_AUTO, "usb_max_packets",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					px4, 0, px4_sysctl_usb_max_packets, "I", "Maximum number of TS packets per USB" );
+
+	SYSCTL_ADD_PROC(scl, sol,
+					OID_AUTO, "usb_max_mbufs",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					px4, 0, px4_sysctl_usb_max_mbufs, "I", "Maximum number of USB mbufs" );	
+
+	SYSCTL_ADD_PROC(scl, sol,
+					OID_AUTO, "discard_ts_packets",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
+					px4, 0, px4_sysctl_discard_ts_packets, "I", "Number of discard ts packets at the start of transfer" );	
 
 	soid = SYSCTL_ADD_NODE(scl, sol,
 						   OID_AUTO, "0s", CTLFLAG_RD, 0, "tuner0(ISDB-S)");
@@ -288,11 +309,10 @@ static int px4_init(struct px4_softc *px4)
 
 	cv_init(&px4->wait_cv, "px4");
 	mutex_init(&px4->wait_mtx);
-	//init_waitqueue_head(&px4->wait);
-	
-	//mtx_init(&px4->lock, "px4", "px4->lock", MTX_DEF | MTX_RECURSE );
+#if !defined(__FreeBSD__)
+	init_waitqueue_head(&px4->wait);
+#endif
 	sx_init(&px4->xlock, "px4->xlock");
-	//usb_callout_init_mtx(&px4->sc_watchdog, &px4->lock, 0 );
 	
 	px4->lnb_power_count = 0;
 	px4->streaming_count = 0;
@@ -300,14 +320,22 @@ static int px4_init(struct px4_softc *px4)
 	for (i = 0; i < TSDEV_NUM; i++) {
 		struct px4_tsdev *tsdev = &px4->tsdev[i];
 
-		mutex_init(&tsdev->lock);
+		sx_init(&tsdev->xlock, "tsdev->xlock");
 		tsdev->id = i;
 		tsdev->init = false;
 		tsdev->open = false;
 		tsdev->lnb_power = false;
 		atomic_set(&tsdev->streaming, 0);
-
+		atomic_set(&tsdev->ts_packet_read, 0 );
+		
 		mtx_init(&tsdev->fifo_lock, "tsdev->fifo_lock", NULL, MTX_DEF );
+		tsdev->stream_buffers = NULL;
+		tsdev->stream_index = 0;
+		tsdev->stream_max_index = 0;
+		tsdev->stream_buffer_size = 0;
+		tsdev->pending_stream_size = 0;
+		tsdev->discard_ts_packets = 0;
+		tsdev->ts_packet_count = 0;
 		tsdev->no_space_count = 0;
 		tsdev->sc_fifo_open= NULL;
 		px4->stream_context->ptsdev[ i ] = tsdev;
@@ -318,7 +346,7 @@ static int px4_init(struct px4_softc *px4)
 
 static int px4_term(struct px4_softc *px4)
 {
-#if 0
+#if !defined(__FreeBSD__)
 	int i;
 
 	for (i = 0; i < TSDEV_NUM; i++) {
@@ -328,11 +356,8 @@ static int px4_term(struct px4_softc *px4)
 	}
 #endif
 
-	//usb_callout_drain( &px4->sc_watchdog );
-	
 	cv_destroy( &px4->wait_cv );
 	mtx_destroy( &px4->wait_mtx );
-	//mtx_destroy( &px4->lock);
 	sx_destroy( &px4->xlock);
 	
 	return 0;
@@ -451,13 +476,13 @@ static int px4_set_power(struct px4_softc *px4, bool on)
 				goto exit;
 		}
 		
-		pause( NULL, MSEC_2_TICKS( 100 ));
+		msleep( 100 );
 		
 		ret = it930x_write_gpio(it930x, 2, true);
 		if (ret)
 			goto exit;
 
-		pause( NULL, MSEC_2_TICKS( 20 ));
+		msleep( 20 );
 
 		for (i = 0; i < TSDEV_NUM; i++) {
 			struct px4_tsdev *t = &px4->tsdev[i];
@@ -529,7 +554,7 @@ static int px4_set_power(struct px4_softc *px4, bool on)
 		} else
 			it930x_write_gpio(it930x, 7, true);
 
-		pause( NULL, MSEC_2_TICKS( 50 ) );
+		msleep( 50 );
 	}
 
 exit:
@@ -539,25 +564,6 @@ exit:
 		dev_dbg(px4->dev, "px4_set_power: ok\n");
 
 	return ret;
-}
-
-static bool px4_fifos_put_bytes_max(void *context)
-{
-	struct px4_stream_context *stream_context = context;
-	struct px4_tsdev *tsdev;
-	int i;
-	bool result=false;
-	
-	for( i = 0; i < TSDEV_NUM; i++){
-		tsdev= stream_context->ptsdev[ i ];
-		if( ( tsdev->sc_fifo_open ) &&
-			( usb_fifo_put_bytes_max(tsdev->sc_fifo_open) != 0) ){
-			result= true;
-			break;
-		}
-	}
-	
-	return result;
 }
 
 static bool px4_ts_sync(u8 **buf, u32 *len, bool *sync_remain)
@@ -643,7 +649,7 @@ static bool px4_ts_sync_with_page_cache(struct usb_page_cache *pc, usb_frlength_
 	return ret;
 }
 
-static void px4_ts_write(struct px4_tsdev **ptsdev, u32 *valid_tsdev, u8 **buf, u32 *len )
+static void px4_ts_write(struct px4_tsdev **ptsdev, u8 **buf, u32 *len )
 {
 
 	u8 *p = *buf;
@@ -656,13 +662,119 @@ static void px4_ts_write(struct px4_tsdev **ptsdev, u32 *valid_tsdev, u8 **buf, 
 		if (id && id < 5) {
 			p[0] = 0x47;
 			tsdev= ptsdev[ id - 1 ];
-			if( valid_tsdev[ id - 1 ] ){
+
+			if( atomic_read( &tsdev->ts_packet_read ) ){
+				struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
+
+				if( !tsdev->ts_packet_count ){
+					dev_dbg( px4->dev, "%s:fifo[%d] ts_packet transfer has started\n",
+							 __FUNCTION__,
+							 id-1 );
+				}
+				
 				if( usb_fifo_put_bytes_max( tsdev->sc_fifo_open) ){
-					usb_fifo_put_data_linear( tsdev->sc_fifo_open, p, 188, 0);
+					u32 index = tsdev->stream_index;
+					u32 max_buf_size = tsdev->stream_buffer_size;
+					u32 prev_pending_size =tsdev->pending_stream_size;
+					u32 pending_size = prev_pending_size + 188;
+					u8 *streambuf = &tsdev->stream_buffers[ max_buf_size * index ];
+					u8 flag = 0;
+					
+					if( pending_size > max_buf_size ){
+						dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu dead end code  is working!!\n",
+								 __FUNCTION__,
+								 id-1,
+								 tsdev->ts_packet_count );
+						
+						flag= usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+														streambuf,
+														prev_pending_size );
+						
+						index++;
+						if( index >= tsdev->stream_max_index ){
+							index = 0;
+						}
+						tsdev->stream_index = index;
+						streambuf = &tsdev->stream_buffers[ max_buf_size * index ];
+						prev_pending_size = 0;
+					}
+
+					if( tsdev->discard_ts_packets > 0 ){
+						tsdev->discard_ts_packets--;
+					}
+					tsdev->ts_packet_count++;
+					
+					if( !tsdev->discard_ts_packets ){
+#ifdef CONTINUITY_COUNTER_CHCEK
+						u32 pid;
+						u32 adaptation_field_control;
+						u32 current;
+						
+						pid  = p[1] << 8;
+						pid += p[2];
+						pid &= 0x1FFF;
+						
+						adaptation_field_control = (p[3] & 0x30)>>4;
+						current = p[3] & 0xF;
+						if( pid != 0x1FFF ){
+							if( tsdev->continuity_counter[pid] >= 0 ){
+								if( ( adaptation_field_control & 1 ) == 0 ){
+									if( current != tsdev->continuity_counter[pid] ){
+										dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu, adap=0 pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x\n",
+												 __FUNCTION__,
+												 id-1,
+												 tsdev->ts_packet_count,
+												 pid,
+												 tsdev->continuity_counter[pid],
+												 p[0],p[1],p[2],p[3]);
+									}
+								}
+								else {
+									if( current != ((tsdev->continuity_counter[pid]+1)&0xF) ){
+										dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu,pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x\n",
+												 __FUNCTION__,
+												 id-1,
+												 tsdev->ts_packet_count,
+												 pid,
+												 tsdev->continuity_counter[pid],
+												 p[0],p[1],p[2],p[3]);
+									}
+								}
+							}
+							tsdev->continuity_counter[pid] = current;
+						}
+#endif
+						
+						memcpy( streambuf + prev_pending_size, p, 188);
+					
+						if( pending_size < max_buf_size ){
+							tsdev->pending_stream_size = pending_size;
+						}
+						else if( pending_size == max_buf_size ){
+							flag = usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+															 streambuf,
+															 pending_size );
+							
+							index++;
+							if( index >= tsdev->stream_max_index ){
+								index = 0;
+							}
+							tsdev->stream_index = index;
+							tsdev->pending_stream_size = 0;
+						}
+						else {
+							tsdev->pending_stream_size = 188;
+						}
+					}
+					
+					if( flag &&
+						( tsdev->sc_fifo_open->used_q.ifq_len > (usb_max_mbufs >> 1 ) ) ){
+						dev_dbg( px4->dev, "%s:fifo[%u] free_q.len=%u, used_q.len=%u\n",__FUNCTION__, id - 1, tsdev->sc_fifo_open->free_q.ifq_len , tsdev->sc_fifo_open->used_q.ifq_len );
+					}
 				}
 				else {
 					if( ( tsdev->no_space_count % FIFO_NO_SPACE_PROHIBIT) == 0 ){
-						dev_dbg( tsdev->parent->dev,"%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
+						dev_dbg( px4->dev,"%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
 					}
 					tsdev->no_space_count++;
 				}
@@ -681,7 +793,7 @@ static void px4_ts_write(struct px4_tsdev **ptsdev, u32 *valid_tsdev, u8 **buf, 
 	return;
 }
 
-static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, u32 *valid_tsdev, struct usb_page_cache *pc, usb_frlength_t *offset, u32 *len)
+static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, struct usb_page_cache *pc, usb_frlength_t *offset, u32 *len)
 {
 
 	u8 *p;
@@ -696,23 +808,126 @@ static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, u32 *valid_t
 
 	while (remain >= 188 && ((p[0] & 0x8f) == 0x07)) {
 		u8 id = (p[0] & 0x70) >> 4;
+		u32 lastflag = 0;
+
+		if( remain < TS_SYNC_SIZE + 188){
+			lastflag = 1;
+		}
 
 		if (id && id < 5) {
 			p[0] = 0x47;
 			tsdev= ptsdev[ id - 1 ];
-			if( valid_tsdev[ id - 1 ] ){
+			
+			if( atomic_read( &tsdev->ts_packet_read ) ){
+				struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
+				
+				if( !tsdev->ts_packet_count ){
+					dev_dbg( px4->dev, "%s:fifo[%d] ts_packet transfer has started\n",
+							 __FUNCTION__,
+							 id-1 );
+				}
+
 				if( usb_fifo_put_bytes_max( tsdev->sc_fifo_open ) ){
-					if(page_len < 188) {
-						usb_fifo_put_data_linear( tsdev->sc_fifo_open, p, page_len, 0);
-						usb_fifo_put_data( tsdev->sc_fifo_open, pc, *offset + page_len, 188-page_len, 0 );
+					u32 index = tsdev->stream_index;
+					u32 max_buf_size = tsdev->stream_buffer_size;
+					u32 prev_pending_size =tsdev->pending_stream_size;
+					u32 pending_size = prev_pending_size + 188;
+					u8 *streambuf = &tsdev->stream_buffers[ max_buf_size * index ];
+					u8 flag = 0;
+
+					if( pending_size > max_buf_size ){
+						dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu dead end code  is working!!\n",
+								 __FUNCTION__,
+								 id-1,
+								 tsdev->ts_packet_count );
+						
+						flag = usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+														 streambuf,
+														 prev_pending_size );
+						
+						index++;
+						if( index >= tsdev->stream_max_index ){
+							index = 0;
+						}
+						tsdev->stream_index = index;
+						streambuf = &tsdev->stream_buffers[ max_buf_size * index ];
+						prev_pending_size = 0;
 					}
-					else {
-						usb_fifo_put_data_linear( tsdev->sc_fifo_open, p, 188, 0);
+					
+					if( tsdev->discard_ts_packets > 0 ){
+						tsdev->discard_ts_packets--;
+					}
+					tsdev->ts_packet_count++;
+					if( !tsdev->discard_ts_packets ){
+#ifdef CONTINUITY_COUNTER_CHCEK
+						u32 pid;
+						u32 adaptation_field_control;
+						u32 current;
+						
+						pid  = p[1] << 8;
+						pid += p[2];
+						pid &= 0x1FFF;
+						
+						adaptation_field_control = (p[3] & 0x30)>>4;
+						current = p[3] & 0xF;
+						if( pid != 0x1FFF ){
+							if( tsdev->continuity_counter[pid] >= 0 ){
+								if( ( adaptation_field_control & 1 ) == 0 ){
+									if( current != tsdev->continuity_counter[pid] ){
+										dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu,adap=0 pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x\n",
+												 __FUNCTION__,
+												 id-1,
+												 tsdev->ts_packet_count,
+												 pid,
+												 tsdev->continuity_counter[pid],
+												 p[0],p[1],p[2],p[3]);
+									}
+								}
+								else {
+									if( current != ((tsdev->continuity_counter[pid]+1)&0xF) ){
+										dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu, pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x\n",
+												 __FUNCTION__,
+												 id-1,
+												 tsdev->ts_packet_count,
+												 pid,
+												 tsdev->continuity_counter[pid],
+												 p[0],p[1],p[2],p[3]);
+									}
+								}
+							}
+							tsdev->continuity_counter[pid] = current;
+						}
+#endif
+				
+						usbd_copy_out( pc, *offset, streambuf + prev_pending_size, 188 );
+						
+						if( pending_size < max_buf_size ){
+							tsdev->pending_stream_size = pending_size;
+						}
+						else if( pending_size == max_buf_size ){
+							flag = usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+															 streambuf,
+															 pending_size );
+							
+							index++;
+							if( index >= tsdev->stream_max_index ){
+								index = 0;
+							}
+							tsdev->stream_index = index;
+							tsdev->pending_stream_size = 0;
+						}
+						else {
+							tsdev->pending_stream_size = 188;
+						}
+					}
+					if( flag &&
+						( tsdev->sc_fifo_open->used_q.ifq_len > (usb_max_mbufs >> 1 ) ) ){
+						dev_dbg( px4->dev, "%s:fifo[%u] free_q.len=%u, used_q.len=%u, lastflag=%u\n",__FUNCTION__, id - 1,tsdev->sc_fifo_open->free_q.ifq_len , tsdev->sc_fifo_open->used_q.ifq_len, lastflag );
 					}
 				}
 				else {
 					if( ( tsdev->no_space_count % FIFO_NO_SPACE_PROHIBIT) == 0 ){
-						dev_dbg( tsdev->parent->dev, "%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
+						dev_dbg( px4->dev, "%s:fifo[%d] has no space, count=%u\n", __FUNCTION__, id - 1, tsdev->no_space_count);
 					}
 					tsdev->no_space_count++;
 				}
@@ -748,32 +963,50 @@ static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
 	u32 remain = len;
 	usb_frlength_t offset=0;
 	bool sync_remain = false;
-	struct px4_tsdev *tsdev;
-	u32 do_unlock[ TSDEV_NUM ] = {0};
-	int i;
 
-	for( i = 0; i < TSDEV_NUM; i++){
-		tsdev = stream_context->ptsdev[ i ];
-		if( (tsdev->open) && (atomic_read( &tsdev->streaming )) ){
-			do_unlock[ i ] = 1;
-			mtx_lock( &tsdev->fifo_lock );
-		}
-	}
-	
 	if (context_remain_len) {
 		if ((context_remain_len + len) >= TS_SYNC_SIZE) {
 			u32 l;
+			u32 org_len= context_remain_len;
+			u32 write_size;
 
-			l = TS_SYNC_SIZE - context_remain_len;
+			l = TS_SYNC_SIZE - org_len;
+			
+			write_size = min( l + TS_SYNC_SIZE , len );
+			
+			usbd_copy_out( pc, offset, context_remain_buf + org_len, write_size );
+			context_remain_len = write_size + org_len;
 
-			usbd_copy_out( pc, offset, context_remain_buf + context_remain_len, l );
-			context_remain_len = TS_SYNC_SIZE;
-
-			if (px4_ts_sync(&context_remain_buf, &context_remain_len, &sync_remain)) {
-				px4_ts_write(stream_context->ptsdev, do_unlock, &context_remain_buf, &context_remain_len );
-
-				offset += l;
-				remain -= l;
+			while( context_remain_len > write_size ){
+				u32 prev_context_remain_len = context_remain_len;
+				if (px4_ts_sync(&context_remain_buf, &context_remain_len, &sync_remain)) {
+					if( !stream_context->sync_flag ){
+						stream_context->sync_flag = 1;
+					}
+					else if( prev_context_remain_len != context_remain_len ){
+						stream_context->resync_count++;
+						pr_debug("px4_on_stream: resync!! resync_count=%d\n", stream_context->resync_count );
+					}
+					px4_ts_write(stream_context->ptsdev, &context_remain_buf, &context_remain_len );
+				}
+				else {
+					if( sync_remain ){
+						pr_debug("px4_on_stream: sync_remain is true\n");
+					}
+					else {
+						pr_debug("px4_on_stream: not found sync byte!! context_remain_len=%d\n", context_remain_len );
+					}
+					break;
+				}
+			}
+			// org_len <=  org_len + write_size - context_remain_len 
+			if( context_remain_len <= write_size ){
+				//  (org_len + write_size - context_remain_len ) - org_len
+				offset += write_size - context_remain_len;
+				remain -= write_size - context_remain_len;
+			}
+			else {
+				pr_debug("px4_on_stream: ng!! context_remain_len=%d write_size=%d\n", context_remain_len, write_size );
 			}
 
 			stream_context->remain_len = 0;
@@ -786,19 +1019,27 @@ static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
 	}
 
 	while (remain) {
-		if (!px4_ts_sync_with_page_cache( pc, &offset, &remain, &sync_remain))
+		u32 prev_remain = remain;
+		if (!px4_ts_sync_with_page_cache( pc, &offset, &remain, &sync_remain)){
+			if(!sync_remain){
+				pr_debug("px4_on_stream: not found sync byte!! len=%d remain=%d offset=%d sync_remain=%d\n", len, remain, offset, sync_remain );
+			}
+			
 			break;
+		}
 
-		px4_ts_write_with_page_cache(stream_context->ptsdev, do_unlock, pc, &offset, &remain );
+		if( !stream_context->sync_flag ){
+			stream_context->sync_flag = 1;
+		}
+		else if( prev_remain != remain ){
+			stream_context->resync_count++;
+			pr_debug("px4_on_stream: resync!! resync_count=%d\n", stream_context->resync_count );
+		}
+		px4_ts_write_with_page_cache(stream_context->ptsdev, pc, &offset, &remain );
+		
+
 	}
 	
-	for( i = 0; i < TSDEV_NUM; i++){
-		tsdev = stream_context->ptsdev[ i ];
-		if( do_unlock[ i ] ){
-			mtx_unlock( &tsdev->fifo_lock );
-		}
-	}
-
 	if (sync_remain) {
 		usbd_copy_out( pc, offset, stream_context->remain_buf, remain );
 		stream_context->remain_len = remain;
@@ -830,7 +1071,7 @@ struct tc90522_regbuf tc_init_t[] = {
 static int px4_tsdev_init(struct px4_tsdev *tsdev)
 {
 	int ret = 0;
-	struct px4_softc *px4 = tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	struct tc90522_demod *tc90522 = &tsdev->tc90522;
 
 	if (tsdev->init)
@@ -949,7 +1190,7 @@ static void px4_tsdev_term(struct px4_tsdev *tsdev)
 
 static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 {
-	struct px4_softc *px4 = tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	
 	int ret = 0, dev_idx = px4->dev_idx;
 	unsigned int tsdev_id = tsdev->id;
@@ -1019,7 +1260,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tuner_locked)
 				break;
 
-			pause( NULL, MSEC_2_TICKS( 10 ));
+			msleep( 10 );
 		}
 
 		if (ret) {
@@ -1050,7 +1291,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && demod_locked)
 				break;
 
-			pause( NULL, MSEC_2_TICKS( 10 ) );
+			msleep( 10 );
 		}
 
 		if (ret) {
@@ -1073,7 +1314,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if ((!ret && tsid) || ret == -EINVAL)
 				break;
 
-			pause( NULL, MSEC_2_TICKS( 10 ) );
+			msleep( 10 );
 		}
 
 		if (ret) {
@@ -1102,7 +1343,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tsid2 == tsid)
 				break;
 
-			pause( NULL, MSEC_2_TICKS( 10 ) );
+			msleep( 10 );
 		}
 
 		dev_dbg(px4->dev, "px4_tsdev_set_channel %d:%u: tc90522_get_tsid_s() tsid2: 0x%04x, count: %d\n", dev_idx, tsdev_id, tsid2, i);
@@ -1167,7 +1408,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tuner_locked)
 				break;
 
-			pause( NULL, MSEC_2_TICKS( 10 ) );
+			msleep( 10 );
 		}
 
 		if (ret) {
@@ -1212,7 +1453,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && demod_locked)
 				break;
 
-			pause( NULL, MSEC_2_TICKS( 10 ) );
+			msleep( 10 );
 		}
 		
 		if (ret) {
@@ -1228,7 +1469,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 		}
 
 		if (i > 265){
-			pause( NULL, MSEC_2_TICKS( (i - 265) * 10 ) );
+			msleep( (i - 265) * 10 );
 		}
 		break;
 	}
@@ -1277,7 +1518,7 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 {
 	int ret = 0;
 	
-	struct px4_softc *px4 = tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	struct it930x_bus *bus = &px4->it930x.bus;
 	struct tc90522_demod *tc90522 = &tsdev->tc90522;
 	unsigned int streaming_count;
@@ -1286,11 +1527,11 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		// already started
 		return 0;
 
+	//#if !defined(__FreeBSD__)
 	atomic_set(&tsdev->streaming, 1);
-
-#if defined(__FreeBSD__)
-	sx_xlock( &px4->xlock);
-#else
+	//#endif
+	
+#if !defined(__FreeBSD__)
 	mutex_lock(&px4->lock);
 #endif
 
@@ -1298,9 +1539,6 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		
 #if defined(__FreeBSD__)
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: streaming_usb_buffer_size: %u\n", px4->dev_idx, tsdev->id, bus->usb.streaming_usb_buffer_size );
-		
-		//usbd_transfer_stop( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
-		
 #else		
 		bus->usb.streaming_urb_buffer_size = 188 * urb_max_packets;
 		bus->usb.streaming_urb_num = max_urbs;
@@ -1316,9 +1554,7 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 #endif
 	}
 
-#if defined(__FreeBSD__)
-	mtx_unlock( &tsdev->fifo_lock );
-#else
+#if !defined(__FreeBSD__)
 	ringbuffer_size = 188 * tsdev_max_packets;
 	dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: size of ringbuffer: %u\n", px4->dev_idx, tsdev->id, ringbuffer_size);
 #endif
@@ -1350,9 +1586,6 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		ret = -EIO;
 		break;
 	}
-#if defined(__FreeBSD__)
-	mtx_lock( &tsdev->fifo_lock );
-#endif
 	
 	if (ret)
 		goto fail;
@@ -1369,14 +1602,17 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 	
 	if (!px4->streaming_count) {
 		px4->stream_context->remain_len = 0;
-
+		px4->stream_context->sync_flag = 0;
+		px4->stream_context->resync_count = 0;
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: starting...\n", px4->dev_idx, tsdev->id);
 		ret = it930x_bus_start_streaming(bus, px4_on_stream, px4->stream_context);
+
 
 		if (ret) {
 			dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: it930x_bus_start_streaming() failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
 			goto fail_after_ringbuffer;
 		}
+		usbd_transfer_start( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 
 #ifdef PSB_DEBUG
 		INIT_DELAYED_WORK(&px4->w, px4_workqueue_handler);
@@ -1389,12 +1625,13 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 #endif
 	}
 
+#if defined(__FreeBSD__)
+	//atomic_set(&tsdev->streaming, 1);
+#endif
 	px4->streaming_count++;
 	streaming_count = px4->streaming_count;
 
-#if defined(__FreeBSD__)
-	sx_xunlock( &px4->xlock);
-#else
+#if !defined(__FreeBSD__)
 	mutex_unlock(&px4->lock);
 #endif
 	
@@ -1404,9 +1641,7 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 fail_after_ringbuffer:
 	//	ringbuffer_stop(tsdev->ringbuf);
 fail:
-#if defined(__FreeBSD__)
-	sx_xunlock( &px4->xlock);
-#else
+#if !defined(__FreeBSD__)
 	mutex_unlock(&px4->lock);
 #endif
 	atomic_set(&tsdev->streaming, 0);
@@ -1419,8 +1654,9 @@ fail:
 static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 {
 	int ret = 0;
-	struct px4_softc *px4 = tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	struct tc90522_demod *tc90522 = &tsdev->tc90522;
+	struct it930x_bus *bus = &px4->it930x.bus;
 	unsigned int streaming_count;
 
 	if (!atomic_read(&tsdev->streaming))
@@ -1440,6 +1676,8 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 		dev_dbg(px4->dev, "px4_tsdev_stop_streaming %d:%u: stopping...\n", px4->dev_idx, tsdev->id);
 		it930x_bus_stop_streaming(&px4->it930x.bus);
 
+		usbd_transfer_stop( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
+		
 #ifdef PSB_DEBUG
 		if (px4->wq) {
 			cancel_delayed_work_sync(&px4->w);
@@ -1451,7 +1689,9 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 	}
 	streaming_count = px4->streaming_count;
 
-#if !defined(__FreeBSD__)
+#if defined(__FreeBSD__)
+	sx_xunlock( &px4->xlock);
+#else
 	mutex_unlock(&px4->lock);
 
 	ringbuffer_stop(tsdev->ringbuf);
@@ -1459,10 +1699,6 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 	
 	if (!avail)
 		return 0;
-
-#if defined(__FreeBSD__)
-	mtx_unlock( &tsdev->fifo_lock );
-#endif
 
 	switch (tsdev->isdb) {
 	case ISDB_S:
@@ -1479,11 +1715,6 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 		ret = -EIO;
 		break;
 	}
-
-#if defined(__FreeBSD__)
-	mtx_lock( &tsdev->fifo_lock );
-	sx_xunlock( &px4->xlock);
-#endif
 	
 	dev_dbg(px4->dev, "px4_tsdev_stop_streaming %d:%u: streaming_count: %u\n", px4->dev_idx, tsdev->id, streaming_count);
 	
@@ -1515,7 +1746,7 @@ static int px4_tsdev_get_cn(struct px4_tsdev *tsdev, u32 *cn)
 static int px4_tsdev_set_lnb_power(struct px4_tsdev *tsdev, bool enable)
 {
 	int ret = 0;
-	struct px4_softc *px4 = tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 
 	if ((tsdev->lnb_power && enable) || (!tsdev->lnb_power && !enable))
 		return 0;
@@ -1582,10 +1813,74 @@ static int px4_sysctl_tsdev_max_packets(SYSCTL_HANDLER_ARGS)
 	return error;
 }
 
+static int px4_sysctl_xfer_packets(SYSCTL_HANDLER_ARGS)
+{
+	int val = xfer_packets;
+	int error;
+
+	error = sysctl_handle_int( oidp, &val, 0, req );
+	if( error ){
+		return error;
+	}
+	if( val != xfer_packets){
+		xfer_packets = val;
+	}
+	
+	return error;
+}
+
+static int px4_sysctl_usb_max_packets(SYSCTL_HANDLER_ARGS)
+{
+	int val = usb_max_packets;
+	int error;
+
+	error = sysctl_handle_int( oidp, &val, 0, req );
+	if( error ){
+		return error;
+	}
+	if( val != usb_max_packets){
+		usb_max_packets = val;
+	}
+	
+	return error;
+}
+
+static int px4_sysctl_usb_max_mbufs(SYSCTL_HANDLER_ARGS)
+{
+	int val = usb_max_mbufs;
+	int error;
+
+	error = sysctl_handle_int( oidp, &val, 0, req );
+	if( error ){
+		return error;
+	}
+	if( val != usb_max_mbufs){
+		usb_max_mbufs = val;
+	}
+	
+	return error;
+}
+
+static int px4_sysctl_discard_ts_packets(SYSCTL_HANDLER_ARGS)
+{
+	int val = discard_ts_packets;
+	int error;
+
+	error = sysctl_handle_int( oidp, &val, 0, req );
+	if( error ){
+		return error;
+	}
+	if( val != discard_ts_packets){
+		discard_ts_packets = val;
+	}
+	
+	return error;
+}
+
 static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS)
 {
 	struct px4_tsdev *tsdev = (struct px4_tsdev *)arg1;
-	struct px4_softc *px4= tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	int avail;
 	int lnb = (tsdev->lnb_power) ? 2:0;
 	bool b;
@@ -1618,7 +1913,9 @@ static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS)
 		return -EINVAL;
 	}
 	
+	sx_xlock( &tsdev->xlock);
 	error= px4_tsdev_set_lnb_power(tsdev, b);
+	sx_xunlock(&tsdev->xlock);
 	if( error ){
 		dev_dbg(px4->dev, "px4_sysctl_lnb:error=%d\n", error);
 	}
@@ -1629,7 +1926,7 @@ static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS)
 static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS)
 {
 	struct px4_tsdev *tsdev = (struct px4_tsdev *)arg1;
-	struct px4_softc *px4= tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	int avail;
 	int val = tsdev->freq;
 	struct ptx_freq freq;
@@ -1653,11 +1950,11 @@ static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS)
 	freq.slot = ((val >> 16)& 0xffff);
 
 #if defined(__FreeBSD__)
-	sx_xlock(&px4->xlock);
+	sx_xlock( &tsdev->xlock);
 #endif
 	error = px4_tsdev_set_channel( tsdev, &freq );
 #if defined(__FreeBSD__)
-	sx_xunlock(&px4->xlock);
+	sx_xunlock(&tsdev->xlock);
 #endif
 	
 	return error;
@@ -1666,7 +1963,7 @@ static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS)
 static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS)
 {
 	struct px4_tsdev *tsdev = (struct px4_tsdev *)arg1;
-	struct px4_softc *px4= tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	int avail;
 	int cn;
 	int error;
@@ -1681,11 +1978,11 @@ static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS)
 	}
 
 #if defined(__FreeBSD__)
-	sx_xlock( &px4->xlock );
+	sx_xlock(&tsdev->xlock);
 #endif
 	error = px4_tsdev_get_cn(tsdev, (u32 *)&cn);
 #if defined(__FreeBSD__)
-	sx_xunlock( &px4->xlock);
+	sx_xunlock(&tsdev->xlock);
 #endif
 	if( error ){
 		return error;
@@ -1708,8 +2005,8 @@ struct tc90522_regbuf tc_init_t0[] = {
 static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 {
 	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4= tsdev->parent;
-	struct it930x_bus *bus = &px4->it930x.bus;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
+	//struct it930x_bus *bus = &px4->it930x.bus;
 	
 	int ret = 0, ref;
 	int dev_idx = device_get_unit(px4->dev);
@@ -1719,14 +2016,14 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 
 #if defined(__FreeBSD__)
 	sx_xlock(&px4->xlock);
-	sx_xlock(&glock);
+	//sx_xlock(&glock);
 #else
 	mutex_lock(&glock);
 #endif	
 	if (!atomic_read(&px4->avail)) {
 		// not available
 #if defined(__FreeBSD__)
-		sx_xunlock(&glock);
+		//sx_xunlock(&glock);
 		sx_xunlock(&px4->xlock);
 #else
 		mutex_unlock(&glock);
@@ -1736,17 +2033,23 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	
 	tsdev = &px4->tsdev[tsdev_id];
 	
-	mutex_lock(&tsdev->lock);
 #if defined(__FreeBSD__)
-	sx_xunlock(&glock);
+	sx_xlock(&tsdev->xlock);
+	//sx_xunlock(&glock);
 #else
+	mutex_lock(&tsdev->lock);
 	mutex_unlock(&glock);
 #endif
 	
 	if (tsdev->open) {
 		// already used by another
 		ret = -EALREADY;
+#if defined(__FreeBSD__)
+		sx_xunlock(&tsdev->xlock);
+#else
 		mutex_unlock(&tsdev->lock);
+#endif
+
 		goto fail;
 	}
 	
@@ -1757,10 +2060,12 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	ref = px4_ref(px4);
 	if (ref <= 1) {
 		ret = -ECANCELED;
-#if !defined(__FreeBSD__)
+#if defined(__FreeBSD__)
+		sx_xunlock(&tsdev->xlock);
+#else
 		mutex_unlock(&px4->lock);
-#endif
 		mutex_unlock(&tsdev->lock);
+#endif
 		goto fail;
 	}
 
@@ -1848,28 +2153,61 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 		}
 	}
 
-	bufsize = usbd_xfer_max_len( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 	error = usb_fifo_alloc_buffer( fifo,
-								   bufsize,
-								   tsdev_max_packets );
+								   1,   // dummy
+								   usb_max_mbufs );
+	
 	if ( error ) {
 	  ret= ENOMEM;
 	  goto fail_after_power;
 	}
-	dev_info( px4->dev,"px4_tsdev_open %d:%u: usbd_xfer_max_len=%u, tsdev_max_packets=%u\n", dev_idx, tsdev_id, bufsize, tsdev_max_packets );
+	
+	bufsize = 188 * tsdev_max_packets * usb_max_mbufs;
+	tsdev->stream_buffers = kmalloc( sizeof(u8) * bufsize, GFP_ATOMIC);
+	if ( tsdev->stream_buffers == NULL ){
+		usb_fifo_free_buffer( fifo );
+		ret= ENOMEM;
+		goto fail_after_power;
+	}
+	tsdev->stream_buffer_size = 188 * tsdev_max_packets;
+	tsdev->stream_index = 0;
+	tsdev->pending_stream_size = 0;
+	tsdev->stream_max_index = usb_max_mbufs;
+	tsdev->discard_ts_packets = discard_ts_packets;
+
+	dev_info( px4->dev,"px4_tsdev_open %d:%u: usb_max_mbufs=%u, buffsize=%u, tsdev_max_packets=%u\n", dev_idx, tsdev_id, usb_max_mbufs, bufsize, tsdev_max_packets );
 
 	tsdev->no_space_count = 0;
+#ifdef  CONTINUITY_COUNTER_CHCEK
+	{
+		u32 count;
+		for( count = 0; count < 0x2000; count++){
+			tsdev->continuity_counter[count] = -1;
+		}
+	}
+#endif
+	
 	tsdev->sc_fifo_open = fifo;
 	
 	tsdev->open = true;
 
-#if !defined(__FreeBSD__)
-	mutex_unlock(&px4->lock);
-#endif
-	mutex_unlock(&tsdev->lock);
 #if defined(__FreeBSD__)
+	
+	dev_dbg( px4->dev, "px4_tsdev_open:start_streaming\n" );
+
+	error = px4_tsdev_start_streaming( tsdev );
+	  
+	if(error){
+	  dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+	}
+	
+	sx_xunlock(&tsdev->xlock);
 	sx_xunlock(&px4->xlock);
+#else
+	mutex_unlock(&px4->lock);
+	mutex_unlock(&tsdev->lock);
 #endif
+
 
 	dev_dbg(px4->dev, "px4_tsdev_open %d:%u: ok\n", dev_idx, tsdev_id);
 
@@ -1880,10 +2218,12 @@ fail_after_power:
 		px4_set_power(px4, false);
 fail_after_ref:
 	px4_unref(px4);
-#if !defined(__FreeBSD__)
+#if defined(__FreeBSD__)
+	sx_xunlock(&tsdev->xlock);
+#else
 	mutex_unlock(&px4->lock);
-#endif
 	mutex_unlock(&tsdev->lock);
+#endif
 fail:
 #if defined(__FreeBSD__)
 	sx_xunlock(&px4->xlock);
@@ -1898,7 +2238,7 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 {
 	int avail, ref;
 	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4= tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	
 	if (!tsdev) {
 		pr_err("px4_tsdev_release: tsdev is NULL.\n");
@@ -1907,21 +2247,35 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	
 	avail = atomic_read(&px4->avail);
 
-	if( tsdev->no_space_count )
-		dev_dbg(px4->dev, "px4_tsdev_release %d:%u: no space count= %u\n", px4->dev_idx, tsdev->id, tsdev->no_space_count);
 	dev_dbg(px4->dev, "px4_tsdev_release %d:%u: avail: %d\n", px4->dev_idx, tsdev->id, avail);
-	
+
+#if defined(__FreeBSD__)
+	sx_xlock(&tsdev->xlock);
+#else
 	mutex_lock(&tsdev->lock);
-	
-	px4_tsdev_stop_streaming(tsdev, (avail) ? true : false);
+#endif
+
+	if (atomic_read(&tsdev->streaming)){
+		dev_dbg(px4->dev, "px4_tsdev_release %d:%u: call px4_tsdev_stop_streaming\n", px4->dev_idx, tsdev->id);
+		px4_tsdev_stop_streaming(tsdev, (avail) ? true : false);
+	}
 	
 	if (avail && tsdev->isdb == ISDB_S)
 		px4_tsdev_set_lnb_power(tsdev, false);
 	
-
 	if ( tsdev->open ){
 		tsdev->sc_fifo_open = NULL;
 		usb_fifo_free_buffer( fifo );
+
+		if( tsdev->stream_buffers != NULL){
+			kfree( tsdev->stream_buffers );
+			tsdev->stream_buffers = NULL;
+		}
+		tsdev->stream_index = 0;
+		tsdev->stream_max_index = 0;
+		tsdev->stream_buffer_size = 0;
+		tsdev->pending_stream_size = 0;
+		tsdev->ts_packet_count = 0;
 	}
 	
 #if defined(__FreeBSD__)
@@ -1937,15 +2291,18 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	if (avail && ref <= 1)
 		px4_set_power(px4, false);
 	
-#if !defined(__FreeBSD__)
+#if defined(__FreeBSD__)
+	sx_xunlock(&px4->xlock);
+#else
 	mutex_unlock(&px4->lock);
 #endif
 	
 	tsdev->open = false;
 	
-	mutex_unlock(&tsdev->lock);
 #if defined(__FreeBSD__)
-	sx_xunlock(&px4->xlock);
+	sx_xunlock(&tsdev->xlock);
+#else
+	mutex_unlock(&tsdev->lock);
 #endif
 	
 	mutex_lock( &px4->wait_mtx );
@@ -1957,19 +2314,20 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 		dev_dbg(px4->dev, "px4_tsdev_release %d:%u: no space count= %u\n", px4->dev_idx, tsdev->id, tsdev->no_space_count);
 	dev_dbg(px4->dev, "px4_tsdev_release %d:%u: ok. ref count: %d\n", px4->dev_idx, tsdev->id, ref);
 
-  return ;
+	return ;
 }
 
 static void px4_tsdev_start_read( struct usb_fifo *fifo )
 {
 	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4 = tsdev->parent;
-	int error;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 
-	error = px4_tsdev_start_streaming( tsdev );
-	if(error){
-		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+	if( !atomic_read(&tsdev->ts_packet_read ) ){
+	  dev_dbg(px4->dev, "px4_tsdev_start_read %d:%u:\n", px4->dev_idx, tsdev->id);
+	  tsdev->discard_ts_packets = discard_ts_packets;
 	}
+	
+	atomic_set(&tsdev->ts_packet_read, 1 );
 	
 	return;
 }
@@ -1977,23 +2335,13 @@ static void px4_tsdev_start_read( struct usb_fifo *fifo )
 static void px4_tsdev_stop_read( struct usb_fifo *fifo )
 {
 	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4 = tsdev->parent;
-	atomic_t avail;
-	int error;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 
-	avail = atomic_read(&px4->avail);
-	
-	dev_dbg(px4->dev, "px4_tsdev_stop_read %d:%u: avail: %d\n", px4->dev_idx, tsdev->id, avail);
-	
-	error = px4_tsdev_stop_streaming(tsdev, (avail) ? true : false);
-	if(error){
-		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+	if( atomic_read(&tsdev->ts_packet_read ) ){
+	  dev_dbg(px4->dev, "px4_tsdev_stop_read %d:%u:\n", px4->dev_idx, tsdev->id);
 	}
+	atomic_set(&tsdev->ts_packet_read, 0 );
 	
-	if (avail && tsdev->isdb == ISDB_S)
-		px4_tsdev_set_lnb_power(tsdev, false);
-	
-
 	return;
 }
 
@@ -2002,7 +2350,7 @@ static int px4_tsdev_ioctl(struct usb_fifo *fifo, u_long cmd, void *data, int ff
 {
 	int ret = -EIO;
 	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4= tsdev->parent;
+	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	int avail;
 	int dev_idx;
 	unsigned int tsdev_id;
@@ -2335,7 +2683,6 @@ static int px4_attach(device_t dev)
 	bus->usb.ctrl_timeout = 3000;
 	bus->usb.iface_num = idesc->bInterfaceNumber;
 	bus->usb.iface_index = iface_index;
-	bus->usb.fifos_put_bytes_max = px4_fifos_put_bytes_max;
 	bus->usb.streaming_usb_buffer_size = 188 * usb_max_packets;
 
 	ret = it930x_bus_init(bus);
@@ -2407,7 +2754,6 @@ static int px4_attach(device_t dev)
 
 	// create /dev/px4video*
 	for( i = 0; i < TSDEV_NUM; i++ ){
-		px4->tsdev[ i ].parent = px4;
 		px4_fifo_methods.postfix[0]= i/2 ? "t": "s";
 
 		error= usb_fifo_attach( uaa->device, &px4->tsdev[ i ],
@@ -2421,10 +2767,6 @@ static int px4_attach(device_t dev)
 	dev_dbg(dev, "px4_attach: created /dev/px4video\n");
 	devs[dev_idx] = px4;
 	
-	//mutex_lock( &px4->lock );
-	//px4_watchdog_reset( px4 );
-	//mutex_unlock( &px4->lock );
-
 #if defined(__FreeBSD__)
 	sx_xunlock(&glock);
 #else
@@ -2491,8 +2833,6 @@ static int px4_detach(device_t dev)
 	mutex_lock(&px4->lock);
 #endif
 
-	//usb_callout_stop( &px4->sc_watchdog );
-	
 #if defined(__FreeBSD__)
 	sx_xlock(&glock);
 #else
@@ -2522,9 +2862,17 @@ static int px4_detach(device_t dev)
 	for (i = 0; i < TSDEV_NUM; i++) {
 		struct px4_tsdev *tsdev = &px4->tsdev[i];
 
+#if defined(__FreeBSD__)
+		sx_xlock(&tsdev->xlock);
+#else
 		mutex_lock(&tsdev->lock);
+#endif
 		px4_tsdev_stop_streaming(tsdev, false);
+#if defined(__FreeBSD__)
+		sx_xunlock(&tsdev->xlock);
+#else
 		mutex_unlock(&tsdev->lock);
+#endif
 	}
 
 	mutex_lock( &px4->wait_mtx );	

@@ -33,6 +33,7 @@
 #include "it930x-config.h"
 #include "it930x-bus.h"
 
+#if !defined(__FreeBSD__)
 struct it930x_usb_context;
 
 struct it930x_usb_work {
@@ -42,17 +43,20 @@ struct it930x_usb_work {
 	struct work_struct work;
 #endif
 };
+#endif
 
 struct it930x_usb_context {
 	struct it930x_bus *bus;
 	it930x_bus_on_stream_t on_stream;
 	void *ctx;
+#if !defined(__FreeBSD__)
 	u32 num_urb;
 	bool no_dma;
 #ifdef IT930X_BUS_USE_WORKQUEUE
 	struct workqueue_struct *wq;
 #endif
 	struct it930x_usb_work *works;
+#endif
 	atomic_t start;
 };
 
@@ -83,8 +87,8 @@ static struct usb_config it930x_ctrl_config[ IT930X_BUS_CTRL_N_TRANSFER] = {
 static struct usb_config it930x_stream_config[ IT930X_BUS_STREAM_N_TRANSFER] = {
 	[IT930X_BUS_STREAM_RD] = {
 		.callback = &it930x_usb_stream_callback,
-		.bufsize = 188*816,
-		.flags = { .short_xfer_ok = 1, .pipe_bof = 1, .proxy_buffer = 1 },
+		.bufsize = 188*816, // overwrite with streaming_usb_buffer_size at it930x_bus_init
+		.flags = { .short_xfer_ok = 1, .pipe_bof = 1, .proxy_buffer = 0 },
 		.timeout = 1000, /* 1 second. */
 		.type = UE_BULK,
 		.endpoint = 0x84,
@@ -246,19 +250,9 @@ void it930x_usb_stream_callback(struct usb_xfer *transfer, usb_error_t error)
 		}
 	case USB_ST_SETUP:
 	tr_setup:
-		if((bus->usb.fifos_put_bytes_max != NULL) && ( context != NULL )){
-			if((*bus->usb.fifos_put_bytes_max)(context)){
-				max = usbd_xfer_max_len( transfer );
-				usbd_xfer_set_frame_len( transfer, 0, max );
-				usbd_transfer_submit(transfer);
-			}
-			else {
-				dev_dbg(bus->dev, "stream fifo has no space\n");
-			}
-		}
-		else {
-			dev_dbg(bus->dev, "stream fifos_put_bytes_max=%p context=%p\n", bus->usb.fifos_put_bytes_max, context);
-		}
+		max = usbd_xfer_max_len( transfer );
+		usbd_xfer_set_frame_len( transfer, 0, max );
+		usbd_transfer_submit(transfer);
 		
 		break;
 	default:
@@ -641,8 +635,6 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 
 #if defined(__FreeBSD__)
 	bus->usb.discard_packets = IT930X_BUS_DISCARD_PACKETS;
-	usbd_xfer_set_stall(bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ]);
-	usbd_transfer_start( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 #else
 	usb_reset_endpoint(dev, 0x84);
 	
@@ -724,7 +716,6 @@ static int it930x_usb_stop_streaming(struct it930x_bus *bus)
 	}
 
 #if defined(__FreeBSD__)
-	usbd_transfer_stop( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 #else
 	n = ctx->num_urb;
 
@@ -787,12 +778,14 @@ int it930x_bus_init(struct it930x_bus *bus)
 			ctx->bus = bus;
 			ctx->on_stream = NULL;
 			ctx->ctx = NULL;
+#if !defined(__FreeBSD__)
 			ctx->num_urb = 0;
 			ctx->no_dma = false;
 #ifdef IT930X_BUS_USE_WORKQUEUE
 			ctx->wq = NULL;
 #endif
 			ctx->works = NULL;
+#endif
 			atomic_set(&ctx->start, 0);
 
 			bus->usb.priv = ctx;

@@ -832,26 +832,14 @@ static int _r850_set_pll(struct r850_tuner *t, u32 lo_freq, u32 if_freq, enum r8
 
 	switch (xtal_div) {
 	case 0:
-#if defined(__FreeBSD__)
-		pause( NULL, MSEC_2_TICKS( 10 ));
-#else
 		msleep(10);
-#endif
 		break;
 	case 1:
 	case 2:
-#if defined(__FreeBSD__)
-		pause( NULL, MSEC_2_TICKS( 20 ));
-#else
 		msleep(20);
-#endif
 		break;
 	default:
-#if defined(__FreeBSD__)
-		pause( NULL, MSEC_2_TICKS( 40 ));
-#else
 		msleep(40);
-#endif
 		break;
 	}
 

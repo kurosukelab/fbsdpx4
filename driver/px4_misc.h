@@ -16,8 +16,8 @@
 
 extern unsigned int px4_debug;
 
-#define kzalloc(A,B) malloc(A,M_DEVBUF,M_NOWAIT)
-#define kmalloc(A,B) malloc(A,M_DEVBUF,M_NOWAIT)
+#define kzalloc(A,B) malloc(A,M_DEVBUF,M_WAITOK)
+#define kmalloc(A,B) malloc(A,M_DEVBUF,M_WAITOK)
 #define vfree(A) free(A,M_DEVBUF)
 #define kfree(A) free(A,M_DEVBUF)
 #define container_of(ptr, type, member) ({                      \
@@ -72,6 +72,11 @@ extern unsigned int px4_debug;
 #define mutex_lock(A)		mtx_lock(A)
 #define mutex_unlock(A)		mtx_unlock(A)
 #define mutex_destroy(A)	mtx_destroy(A)
+
+#ifdef msleep
+#undef msleep
+#define msleep(A) pause( NULL, MSEC_2_TICKS( A ))
+#endif
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 

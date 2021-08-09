@@ -8,19 +8,19 @@
 #include <dev/usb/usbdi.h>
 
 enum {
-      IT930X_BUS_CTRL_WR,
-      IT930X_BUS_CTRL_RD,
-      IT930X_BUS_CTRL_N_TRANSFER
+	IT930X_BUS_CTRL_WR,
+	IT930X_BUS_CTRL_RD,
+	IT930X_BUS_CTRL_N_TRANSFER
 };
 
 enum {
-      IT930X_BUS_STREAM_RD,
-      IT930X_BUS_STREAM_N_TRANSFER
+	IT930X_BUS_STREAM_RD,
+	IT930X_BUS_STREAM_N_TRANSFER
 };
 
 #define IT930X_BUS_TRANSFERRED (1)
 #define IT930X_BUS_BUF_SIZE (256)
-#define IT930X_BUS_CMD_MAX_BUFFERS (2)
+#define IT930X_BUS_CMD_MAX_BUFFERS (16)
 
 #else
 #include <linux/device.h>
@@ -74,11 +74,12 @@ struct it930x_bus {
 			int ctrl_timeout;
 #if !defined(__FreeBSD__)
 			u32 streaming_urb_buffer_size;
-#endif
 			u32 streaming_urb_num;
 			bool streaming_no_dma;
+#endif
 			void *priv;
 #if defined(__FreeBSD__)
+			u32 streaming_usb_mbufs;
 			u32 streaming_usb_buffer_size;
 			uint8_t iface_num;
 			uint8_t iface_index;
@@ -96,7 +97,6 @@ struct it930x_bus {
 			struct mtx xfer_mtx;
 			struct mtx stream_mtx;
 			u32 event;
-			bool (*fifos_put_bytes_max)(void *context);
 #endif
 		} usb;
 	};
