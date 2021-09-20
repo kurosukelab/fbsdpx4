@@ -3,17 +3,18 @@
 FreeNASで録画サーバーを運用したいためにPLEX PX-W3U4/Q3U4/W3PE4/Q3PE4用の非公式版Linuxドライバをfbsdpt3を参考にFreeBSDに移植してみました。  
 [非公式版Linuxドライバ](https://github.com/nns779/px4_drv)のv0.2.1a(90e0a4b30b812e7e5fff4483144f165de8914157)をベースにしています。  
 
-Kernel Panicが発生する可能性があります。
+Kernel Panicが発生する可能性があります。  
 Freebsdのmtx(mutex)は,一定時間以上SleepしているととKernel Panic(Sleeping Thread)が発生するので、sx_xlockに置き換え。 
 
-1channelだとdropが発生しないけれど、2channel目の制御することでdropが発生している感じ。 
-continuty_counterをcheckしていると、周波数を設定後や、他のchannelをclose時に不連続が発生する。
-周波数設定後については、ts packetをdiscardすることで、回避可能だが、他のchannelの制御信号が別のchannelに影響を与える理由が不明。 
-また、channelの制御未実施のTimingで、decode ngも発生することがある。(壊れた？) 
+1channelだとdropが発生しないけれど、2channel目の制御することでdropが発生している感じ。   
+continuty_counterをcheckすると、周波数を設定後や、他のchannelをclose時に不連続が発生する。   
+周波数設定後については、ts packetをdiscardすることで、回避できるが、他のchannelの制御信号が別のchannelに影響を与える理由が不明。   
+また、channelの制御をしていないTimingで、decode ngも発生することがある。(壊れた？) 
 
 
 ## 対応デバイス
 
+- PX-W3U4
 - PX-Q3PE4
 
 ## インストール
