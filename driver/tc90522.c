@@ -1,6 +1,9 @@
-// tc90522.c
-
-// Toshiba TC90522 driver
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Toshiba TC90522 driver (tc90522.c)
+ *
+ * Copyright (c) 2018-2019 nns779
+ */
 
 #if defined(__FreeBSD__)
 #include <sys/param.h>
@@ -24,16 +27,97 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/mutex.h>
+#include <linux/slab.h>
 #include <linux/device.h>
 #endif
 
 #include "i2c_comm.h"
 #include "tc90522.h"
 
+static int _tc90522_read_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 len)
+{
+	int ret = 0;
+	u8 b;
+	struct i2c_comm_request req[2];
+
+	if (!buf || !len)
+		return -EINVAL;
+
+	b = reg;
+
+	req[0].req = I2C_WRITE_REQUEST;
+	req[0].addr = demod->i2c_addr;
+	req[0].data = &b;
+	req[0].len = 1;
+
+	req[1].req = I2C_READ_REQUEST;
+	req[1].addr = demod->i2c_addr;
+	req[1].data = buf;
+	req[1].len = len;
+
+	ret = i2c_comm_master_request(demod->i2c, req, 2);
+	if (ret)
+		dev_err(demod->dev, "_tc90522_read_regs: i2c_comm_master_request() failed. (addr: 0x%x, reg: 0x%x, len: %u)\n", demod->i2c_addr, reg, len);
+
+	return ret;
+}
+
+static int _tc90522_read_reg(struct tc90522_demod *demod, u8 reg, u8 *val)
+{
+	return _tc90522_read_regs(demod, reg, val, 1);
+}
+
+int tc90522_read_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 len)
+{
+	int ret = 0;
+
+	mutex_lock(&demod->priv.lock);
+
+	ret = _tc90522_read_regs(demod, reg, buf, len);
+
+	mutex_unlock(&demod->priv.lock);
+
+	return ret;
+}
+
+int tc90522_read_reg(struct tc90522_demod *demod, u8 reg, u8 *val)
+{
+	int ret = 0;
+
+	mutex_lock(&demod->priv.lock);
+
+	ret = _tc90522_read_regs(demod, reg, val, 1);
+
+	mutex_unlock(&demod->priv.lock);
+
+	return ret;
+}
+
+int tc90522_read_multiple_regs(struct tc90522_demod *demod, struct tc90522_regbuf *regbuf, int num)
+{
+	int ret = 0, i;
+
+	if (!regbuf || !num)
+		return -EINVAL;
+
+	mutex_lock(&demod->priv.lock);
+
+	for (i = 0; i < num; i++) {
+		ret = _tc90522_read_regs(demod, regbuf[i].reg, regbuf[i].buf, regbuf[i].u.len);
+		if (ret)
+			break;
+	}
+
+	mutex_unlock(&demod->priv.lock);
+
+	return ret;
+}
+
 static int _tc90522_write_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 len)
 {
 	int ret = 0;
 	u8 b[255];
+	struct i2c_comm_request req[1];
 
 	if (!buf || !len)
 		return -EINVAL;
@@ -45,22 +129,52 @@ static int _tc90522_write_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 
 	b[0] = reg;
 	memcpy(&b[1], buf, len);
 
-	ret = i2c_comm_master_lock(demod->i2c);
-	if (ret) {
-		dev_err(demod->dev, "_tc90522_write_regs: i2c_comm_master_lock() failed. (addr: 0x%x, reg: 0x%x, len: %u, ret: %d)\n", demod->i2c_addr, reg, len, ret);
-		return ret;
-	}
+	req[0].req = I2C_WRITE_REQUEST;
+	req[0].addr = demod->i2c_addr;
+	req[0].data = b;
+	req[0].len = 1 + len;
 
-	ret = i2c_comm_master_write(demod->i2c, demod->i2c_addr, b, len + 1);
+	ret = i2c_comm_master_request(demod->i2c, req, 1);
 	if (ret)
-		dev_err(demod->dev, "_tc90522_write_regs: i2c_comm_master_write() failed. (addr: 0x%x, reg: 0x%x, len: %u, ret: %d)\n", demod->i2c_addr, reg, len, ret);
-
-	i2c_comm_master_unlock(demod->i2c);
+		dev_err(demod->dev, "_tc90522_write_regs: i2c_comm_master_request() failed. (addr: 0x%x, reg: 0x%x, len: %u, ret: %d)\n", demod->i2c_addr, reg, len, ret);
 
 	return ret;
 }
 
-int tc90522_write_regs(struct tc90522_demod *demod, struct tc90522_regbuf *regbuf, int num)
+#if 0
+static int _tc90522_write_reg(struct tc90522_demod *demod, u8 reg, u8 val)
+{
+	return _tc90522_write_regs(demod, reg, &val, 1);
+}
+#endif
+
+int tc90522_write_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 len)
+{
+	int ret = 0;
+
+	mutex_lock(&demod->priv.lock);
+
+	ret = _tc90522_write_regs(demod, reg, buf, len);
+
+	mutex_unlock(&demod->priv.lock);
+
+	return ret;
+}
+
+int tc90522_write_reg(struct tc90522_demod *demod, u8 reg, u8 val)
+{
+	int ret = 0;
+
+	mutex_lock(&demod->priv.lock);
+
+	ret = _tc90522_write_regs(demod, reg, &val, 1);
+
+	mutex_unlock(&demod->priv.lock);
+
+	return ret;
+}
+
+int tc90522_write_multiple_regs(struct tc90522_demod *demod, struct tc90522_regbuf *regbuf, int num)
 {
 	int ret = 0, i;
 
@@ -84,144 +198,154 @@ int tc90522_write_regs(struct tc90522_demod *demod, struct tc90522_regbuf *regbu
 	return ret;
 }
 
-int tc90522_write_reg(struct tc90522_demod *demod, u8 reg, u8 val)
+static int tc90522_i2c_master_request(void *i2c_priv, struct i2c_comm_request *req, int num)
 {
-	int ret = 0;
-
-	mutex_lock(&demod->priv.lock);
-
-	ret = _tc90522_write_regs(demod, reg, &val, 1);
-
-	mutex_unlock(&demod->priv.lock);
-
-	return ret;
-}
-
-static int _tc90522_read_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 len)
-{
-	int ret = 0;
-	u8 b;
-
-	if (!buf || !len)
-		return -EINVAL;
-
-	b = reg;
-
-	ret = i2c_comm_master_lock(demod->i2c);
-	if (ret) {
-		dev_err(demod->dev, "_tc90522_read_regs: i2c_comm_master_lock() failed. (addr: 0x%x, reg: 0x%x, len: %u)\n", demod->i2c_addr, reg, len);
-		return ret;
-	}
-
-	ret = i2c_comm_master_write(demod->i2c, demod->i2c_addr, &b, 1);
-	if (ret) {
-		dev_err(demod->dev, "_tc90522_read_regs: i2c_comm_master_write() failed. (addr: 0x%x, reg: 0x%x, len: %u)\n", demod->i2c_addr, reg, len);
-		goto exit;
-	}
-
-	ret = i2c_comm_master_read(demod->i2c, demod->i2c_addr, buf, len);
-	if (ret)
-		dev_err(demod->dev, "_tc90522_read_regs: i2c_comm_master_read() failed. (addr: 0x%x, reg: 0x%x, len: %u)\n", demod->i2c_addr, reg, len);
-
-exit:
-	i2c_comm_master_unlock(demod->i2c);
-
-	return ret;
-}
-
-int tc90522_read_regs(struct tc90522_demod *demod, struct tc90522_regbuf *regbuf, int num)
-{
-	int ret = 0, i;
-
-	if (!regbuf || !num)
-		return -EINVAL;
+	int ret = 0, i, master_req_num = 0, n = 0;
+	struct tc90522_demod *demod = i2c_priv;
+	struct i2c_comm_request *master_req = NULL;
 
 	mutex_lock(&demod->priv.lock);
 
 	for (i = 0; i < num; i++) {
-		ret = _tc90522_read_regs(demod, regbuf[i].reg, regbuf[i].buf, regbuf[i].u.len);
-		if (ret)
+		switch (req[i].req) {
+		case I2C_READ_REQUEST:
+			if (!req[i].data || !req[i].len) {
+				dev_dbg(demod->dev, "tc90522_i2c_master_request: Invalid parameter. (i: %d)\n", i);
+				ret = -EINVAL;
+				break;
+			}
+
+			master_req_num += 2;
 			break;
+
+		case I2C_WRITE_REQUEST:
+			if (!req[i].data || !req[i].len || req[i].len > 253) {
+				dev_dbg(demod->dev, "tc90522_i2c_master_request: Invalid parameter. (i: %d)\n", i);
+				ret = -EINVAL;
+				break;
+			}
+
+			master_req_num++;
+			break;
+
+		default:
+			ret = -EINVAL;
+			break;
+		}
 	}
 
-	mutex_unlock(&demod->priv.lock);
-
-	return ret;
-}
-
-int tc90522_read_reg(struct tc90522_demod *demod, u8 reg, u8 *val)
-{
-	int ret = 0;
-
-	mutex_lock(&demod->priv.lock);
-
-	ret = _tc90522_read_regs(demod, reg, val, 1);
-
-	mutex_unlock(&demod->priv.lock);
-
-	return ret;
-}
-
-static int tc90522_i2c_master_lock(void *i2c_priv)
-{
-	struct tc90522_demod *demod = i2c_priv;
-
-	mutex_lock(&demod->priv.lock);
-	return i2c_comm_master_lock(demod->i2c);
-}
-
-static int tc90522_i2c_master_unlock(void *i2c_priv)
-{
-	int ret = 0;
-	struct tc90522_demod *demod = i2c_priv;
-
-	ret = i2c_comm_master_unlock(demod->i2c);
-	mutex_unlock(&demod->priv.lock);
-
-	return ret;
-}
-
-static int tc90522_i2c_master_write(void *i2c_priv, u8 addr, const u8 *data, int len)
-{
-	int ret = 0;
-	struct tc90522_demod *demod = i2c_priv;
-	u8 b[255];
-
-	if (!data || !len || len > 253)
-		return -EINVAL;
-
-	b[0] = 0xfe;
-	b[1] = (addr << 1);
-	memcpy(&b[2], data, len);
-
-	ret = i2c_comm_master_write(demod->i2c, demod->i2c_addr, b, len + 2);
 	if (ret)
-		dev_err(demod->dev, "tc09522_i2c_master_write: i2c_comm_master_write() failed. (demod addr: 0x%x, addr: 0x%x, len: %u)\n", demod->i2c_addr, addr, len);
+		goto exit;
 
-	return ret;
-}
+	if (!master_req_num)
+		goto exit;
 
-static int tc90522_i2c_master_read(void *i2c_priv, u8 addr, u8 *data, int len)
-{
-	int ret = 0;
-	struct tc90522_demod *demod = i2c_priv;
-	u8 b[2];
+	if ((num == 1 && req[0].req == I2C_WRITE_REQUEST) || (num == 2 && req[0].req == I2C_WRITE_REQUEST && req[1].req == I2C_READ_REQUEST)) {
+		u8 b[255], br[2];
+		struct i2c_comm_request master_req[3];
 
-	if (!data || !len)
-		return -EINVAL;
+		b[0] = 0xfe;
+		b[1] = (req[0].addr << 1);
+		memcpy(&b[2], req[0].data, req[0].len);
 
-	b[0] = 0xfe;
-	b[1] = (addr << 1) | 0x01;
+		master_req[0].req = I2C_WRITE_REQUEST;
+		master_req[0].addr = demod->i2c_addr;
+		master_req[0].data = b;
+		master_req[0].len = 2 + req[0].len;
 
-	ret = i2c_comm_master_write(demod->i2c, demod->i2c_addr, b, 2);
-	if (ret) {
-		dev_err(demod->dev, "tc09522_i2c_master_read: i2c_comm_master_write() failed. (demod addr: 0x%x, addr: 0x%x, len: %u)\n", demod->i2c_addr, addr, len);
-		return ret;
+		if (num == 2) {
+			br[0] = 0xfe;
+			br[1] = (req[1].addr << 1) | 0x01;
+
+			master_req[1].req = I2C_WRITE_REQUEST;
+			master_req[1].addr = demod->i2c_addr;
+			master_req[1].data = br;
+			master_req[1].len = 2;
+
+			master_req[2].req = I2C_READ_REQUEST;
+			master_req[2].addr = demod->i2c_addr;
+			master_req[2].data = req[1].data;
+			master_req[2].len = req[1].len;
+		}
+
+		ret = i2c_comm_master_request(demod->i2c, master_req, (num == 2) ? 3 : 1);
+		goto exit;
 	}
 
-	ret = i2c_comm_master_read(demod->i2c, demod->i2c_addr, data, len);
-	if (ret)
-		dev_err(demod->dev, "tc09522_i2c_master_read: i2c_comm_master_read() failed. (demod addr: 0x%x, addr: 0x%x, len: %u)\n", demod->i2c_addr, addr, len);
+	master_req = (struct i2c_comm_request *)kmalloc(sizeof(*master_req) * master_req_num, GFP_KERNEL);
+	if (!master_req) {
+		ret = -ENOMEM;
+		goto exit;
+	}
+
+	for (i = 0; i < num; i++) {
+		u8 *b;
+
+		switch (req[i].req) {
+		case I2C_READ_REQUEST:
+			b = (u8 *)kmalloc(sizeof(*b) * 2, GFP_KERNEL);
+			if (!b) {
+				ret = -ENOMEM;
+				break;
+			}
+
+			b[0] = 0xfe;
+			b[1] = (req[i].addr << 1) | 0x01;
+
+			master_req[n].req = I2C_WRITE_REQUEST;
+			master_req[n].addr = demod->i2c_addr;
+			master_req[n].data = b;
+			master_req[n].len = 2;
+
+			master_req[n + 1].req = I2C_READ_REQUEST;
+			master_req[n + 1].addr = demod->i2c_addr;
+			master_req[n + 1].data = req[i].data;
+			master_req[n + 1].len = req[i].len;
+
+			n += 2;
+			break;
+
+		case I2C_WRITE_REQUEST:
+			b = (u8 *)kmalloc(sizeof(*b) * (2 + req[i].len), GFP_KERNEL);
+			if (!b) {
+				ret = -ENOMEM;
+				break;
+			}
+
+			b[0] = 0xfe;
+			b[1] = (req[i].addr << 1);
+			memcpy(&b[2], req[i].data, req[i].len);
+
+			master_req[n].req = I2C_WRITE_REQUEST;
+			master_req[n].addr = demod->i2c_addr;
+			master_req[n].data = b;
+			master_req[n].len = 2 + req[i].len;
+
+			n++;
+			break;
+
+		default:
+			ret = -EINVAL;
+			break;
+		}
+
+		if (ret)
+			goto exit_with_free;
+	}
+
+	ret = i2c_comm_master_request(demod->i2c, master_req, master_req_num);
+
+exit_with_free:
+	for (i = 0; i < master_req_num; i++) {
+		if (master_req[i].req == I2C_WRITE_REQUEST && master_req[i].data)
+			kfree(master_req[i].data);
+	}
+
+	if (master_req)
+		kfree(master_req);
+
+exit:
+	mutex_unlock(&demod->priv.lock);
 
 	return ret;
 }
@@ -230,10 +354,7 @@ int tc90522_init(struct tc90522_demod *demod)
 {
 	mutex_init(&demod->priv.lock);
 
-	demod->i2c_master.lock = tc90522_i2c_master_lock;
-	demod->i2c_master.unlock = tc90522_i2c_master_unlock;
-	demod->i2c_master.wr = tc90522_i2c_master_write;
-	demod->i2c_master.rd = tc90522_i2c_master_read;
+	demod->i2c_master.request = tc90522_i2c_master_request;
 	demod->i2c_master.priv = demod;
 
 	return 0;
@@ -241,8 +362,7 @@ int tc90522_init(struct tc90522_demod *demod)
 
 int tc90522_term(struct tc90522_demod *demod)
 {
-	demod->i2c_master.wr = NULL;
-	demod->i2c_master.rd = NULL;
+	demod->i2c_master.request = NULL;
 	demod->i2c_master.priv = NULL;
 
 	mutex_destroy(&demod->priv.lock);
@@ -264,7 +384,7 @@ int tc90522_sleep_s(struct tc90522_demod *demod, bool sleep)
 		regbuf[1].u.val = 0xff;
 	}
 
-	return tc90522_write_regs(demod, regbuf, 2);
+	return tc90522_write_multiple_regs(demod, regbuf, 2);
 #else
 	return tc90522_write_reg(demod, 0x17, (sleep) ? 0x01 : 0x00);
 #endif
@@ -289,20 +409,30 @@ int tc90522_set_agc_s(struct tc90522_demod *demod, bool on)
 		regbuf[2].u.val = 0x00;
 	}
 
-	return tc90522_write_regs(demod, regbuf, 4);
+	return tc90522_write_multiple_regs(demod, regbuf, 4);
 }
 
 int tc90522_tmcc_get_tsid_s(struct tc90522_demod *demod, u8 idx, u16 *tsid)
 {
 	int ret = 0;
 	u8 b[2];
-	struct tc90522_regbuf regbuf[1];
 
 	if (idx >= 12)
 		return -EINVAL;
 
-	tc90522_regbuf_set_buf(&regbuf[0], 0xce + (idx * 2), &b[0], 2);
-	ret = tc90522_read_regs(demod, regbuf, 1);
+	ret = tc90522_read_regs(demod, 0xce + (idx * 2), &b[0], 2);
+	if (!ret)
+		*tsid = (b[0] << 8 | b[1]);
+
+	return ret;
+}
+
+int tc90522_get_tsid_s(struct tc90522_demod *demod, u16 *tsid)
+{
+	int ret = 0;
+	u8 b[2];
+
+	ret = tc90522_read_regs(demod, 0xe6, &b[0], 2);
 	if (!ret)
 		*tsid = (b[0] << 8 | b[1]);
 
@@ -312,39 +442,19 @@ int tc90522_tmcc_get_tsid_s(struct tc90522_demod *demod, u8 idx, u16 *tsid)
 int tc90522_set_tsid_s(struct tc90522_demod *demod, u16 tsid)
 {
 	u8 b[2];
-	struct tc90522_regbuf regbuf[2];
 
 	b[0] = ((tsid >> 8) & 0xff);
 	b[1] = (tsid & 0xff);
 
-	tc90522_regbuf_set_buf(&regbuf[0], 0x8f, &b[0], 1);
-	tc90522_regbuf_set_buf(&regbuf[1], 0x90, &b[1], 1);
-
-	return tc90522_write_regs(demod, regbuf, 2);
-}
-
-int tc90522_get_tsid_s(struct tc90522_demod *demod, u16 *tsid)
-{
-	int ret = 0;
-	u8 b[2];
-	struct tc90522_regbuf regbuf[1];
-
-	tc90522_regbuf_set_buf(&regbuf[0], 0xe6, &b[0], 2);
-	ret = tc90522_read_regs(demod, regbuf, 1);
-	if (!ret)
-		*tsid = (b[0] << 8 | b[1]);
-
-	return ret;
+	return tc90522_write_regs(demod, 0x8f, b, 2);
 }
 
 int tc90522_get_cn_s(struct tc90522_demod *demod, u16 *cn)
 {
 	int ret = 0;
 	u8 b[2];
-	struct tc90522_regbuf regbuf[1];
 
-	tc90522_regbuf_set_buf(&regbuf[0], 0xbc, &b[0], 2);
-	ret = tc90522_read_regs(demod, regbuf, 1);
+	ret = tc90522_read_regs(demod, 0xbc, &b[0], 2);
 	if (!ret)
 		*cn = (b[0] << 8) | b[1];
 
@@ -363,7 +473,7 @@ int tc90522_enable_ts_pins_s(struct tc90522_demod *demod, bool e)
 		regbuf[1].u.val = 0x22;
 	}
 
-	return tc90522_write_regs(demod, regbuf, 2);
+	return tc90522_write_multiple_regs(demod, regbuf, 2);
 }
 
 int tc90522_is_signal_locked_s(struct tc90522_demod *demod, bool *lock)
@@ -402,17 +512,15 @@ int tc90522_set_agc_t(struct tc90522_demod *demod, bool on)
 		// on
 		regbuf[2].u.val &= ~0x01;
 
-	return tc90522_write_regs(demod, regbuf, 4);
+	return tc90522_write_multiple_regs(demod, regbuf, 4);
 }
 
 int tc90522_get_cndat_t(struct tc90522_demod *demod, u32 *cndat)
 {
 	int ret = 0;
 	u8 b[3];
-	struct tc90522_regbuf regbuf[1];
 
-	tc90522_regbuf_set_buf(&regbuf[0], 0x8b, &b[0], 3);
-	ret = tc90522_read_regs(demod, regbuf, 1);
+	ret = tc90522_read_regs(demod, 0x8b, &b[0], 3);
 	if (!ret)
 		*cndat = (b[0] << 16) | (b[1] << 8) | b[2];
 
@@ -433,11 +541,11 @@ int tc90522_is_signal_locked_t(struct tc90522_demod *demod, bool *lock)
 
 	mutex_lock(&demod->priv.lock);
 
-	ret = _tc90522_read_regs(demod, 0x80, &b, 1);
+	ret = _tc90522_read_reg(demod, 0x80, &b);
 	if (ret || (b & 0x28))
 		goto exit;
 
-	ret = _tc90522_read_regs(demod, 0xb0, &b, 1);
+	ret = _tc90522_read_reg(demod, 0xb0, &b);
 	if (ret || (b & 0x0f) < 8)
 		goto exit;
 

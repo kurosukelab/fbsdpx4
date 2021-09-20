@@ -1,4 +1,9 @@
-// it930x-bus.h
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * ITE IT930x bus driver definitions (it930x-bus.h)
+ *
+ * Copyright (c) 2018-2019 nns779
+ */
 
 #ifndef	__IT930X_BUS_H__
 #define __IT930X_BUS_H__
@@ -27,17 +32,15 @@ enum {
 #include <linux/usb.h>
 #endif
 
-#include "it930x-config.h"
-
 typedef enum {
 	IT930X_BUS_NONE = 0,
 	IT930X_BUS_USB,
 } it930x_bus_type_t;
 
 #if defined(__FreeBSD__)
-typedef int (*it930x_bus_on_stream_t)(void *context, struct usb_page_cache *pc, u32 len);
+typedef int (*it930x_bus_stream_handler_t)(void *context, struct usb_page_cache *pc, u32 len);
 #else
-typedef int (*it930x_bus_on_stream_t)(void *context, void *buf, u32 len);
+typedef int (*it930x_bus_stream_handler_t)(void *context, void *buf, u32 len);
 #endif
 
 struct it930x_bus;
@@ -46,7 +49,7 @@ struct it930x_bus_operations {
 	int (*ctrl_tx)(struct it930x_bus *bus, const void *buf, int len, void *opt);
 	int (*ctrl_rx)(struct it930x_bus *bus, void *buf, int *len, void *opt);
 	int (*stream_rx)(struct it930x_bus *bus, void *buf, int *len, int timeout);
-	int (*start_streaming)(struct it930x_bus *bus, it930x_bus_on_stream_t on_stream, void *context);
+	int (*start_streaming)(struct it930x_bus *bus, it930x_bus_stream_handler_t stream_handler, void *context);
 	int (*stop_streaming)(struct it930x_bus *bus);
 };
 #if defined(__FreeBSD__)
@@ -130,12 +133,12 @@ static inline int it930x_bus_stream_rx(struct it930x_bus *bus, void *buf, int *l
 	return bus->ops.stream_rx(bus, buf, len, timeout);
 }
 
-static inline int it930x_bus_start_streaming(struct it930x_bus *bus, it930x_bus_on_stream_t on_stream, void *context)
+static inline int it930x_bus_start_streaming(struct it930x_bus *bus, it930x_bus_stream_handler_t stream_handler, void *context)
 {
 	if (!bus || !bus->ops.start_streaming)
 		return -EINVAL;
 
-	return bus->ops.start_streaming(bus, on_stream, context);
+	return bus->ops.start_streaming(bus, stream_handler, context);
 }
 
 static inline int it930x_bus_stop_streaming(struct it930x_bus *bus)

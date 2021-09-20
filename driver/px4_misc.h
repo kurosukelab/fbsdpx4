@@ -98,6 +98,4 @@ extern unsigned int px4_debug;
   
 #define EREMOTEIO	EIO
 
-#define FIRMWARE_FILENAME	"it930x_fw"
-
 #endif

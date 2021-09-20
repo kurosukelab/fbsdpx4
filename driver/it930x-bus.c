@@ -1,6 +1,10 @@
-// it930x-bus.c
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * ITE IT930x bus driver (it930x-bus.c)
+ *
+ * Copyright (c) 2018-2019 nns779
+ */
 
-// IT930x bus functions
 #if defined(__FreeBSD__)
 #include <sys/param.h>
 #include <sys/bus.h>
@@ -30,7 +34,6 @@
 #include <linux/usb.h>
 #endif
 
-#include "it930x-config.h"
 #include "it930x-bus.h"
 
 #if !defined(__FreeBSD__)
@@ -47,7 +50,7 @@ struct it930x_usb_work {
 
 struct it930x_usb_context {
 	struct it930x_bus *bus;
-	it930x_bus_on_stream_t on_stream;
+	it930x_bus_stream_handler_t stream_handler;
 	void *ctx;
 #if !defined(__FreeBSD__)
 	u32 num_urb;
@@ -245,7 +248,7 @@ void it930x_usb_stream_callback(struct usb_xfer *transfer, usb_error_t error)
 			}
 			
 			if(!bus->usb.discard_packets){
-				ctx->on_stream(context, pc , actual);
+				ctx->stream_handler(context, pc , actual);
 			}
 		}
 	case USB_ST_SETUP:
@@ -368,12 +371,12 @@ static int it930x_usb_ctrl_tx(struct it930x_bus *bus, const void *buf, int len, 
 	const u8 *p = buf;
 #endif
 
-	if (len > IT930X_USB_MAX_CONTROL_TRANSFER_SIZE || !buf || !len)
+	if (len > 63 || !buf || !len)
 		return -EINVAL;
 
 #if 0
 	while (len > 0) {
-		int s = (len < IT930X_USB_MAX_CONTROL_PACKET_SIZE) ? len : IT930X_USB_MAX_CONTROL_PACKET_SIZE;
+		int s = (len < 255) ? len : 255;
 
 		ret = usb_bulk_msg(dev, usb_sndbulkpipe(dev, 0x02), p, s, &rlen, bus->usb.timeout);
 		if (ret)
@@ -390,9 +393,6 @@ static int it930x_usb_ctrl_tx(struct it930x_bus *bus, const void *buf, int len, 
 	ret = usb_bulk_msg(dev, usb_sndbulkpipe(dev, 0x02), (void *)buf, len, &rlen, bus->usb.ctrl_timeout);
 #endif
 #endif
-
-	if (ret)
-		dev_dbg(bus->dev, "it930x_usb_ctrl_tx: Failed. (ret: %d)\n", ret);
 
 	mdelay(1);
 	
@@ -437,8 +437,6 @@ static int it930x_usb_stream_rx(struct it930x_bus *bus, void *buf, int *len, int
 
 	/* Endpoint 0x84: Stream OUT */
 	ret = usb_bulk_msg(dev, usb_rcvbulkpipe(dev, 0x84), buf, *len, &rlen, timeout);
-	if (ret)
-		dev_dbg(bus->dev, "it930x_usb_stream_rx: Failed. (ret: %d)\n", ret);
 
 	*len = rlen;
 #endif
@@ -492,7 +490,7 @@ static void it930x_usb_workqueue_handler(struct work_struct *work)
 	struct it930x_usb_context *ctx = w->ctx;
 	int ret = 0;
 
-	ret = usb_submit_urb(w->urb, GFP_ATOMIC);
+	ret = usb_submit_urb(w->urb, GFP_KERNEL);
 	if (ret)
 		dev_dbg(ctx->bus->dev, "it930x_usb_workqueue_handler: usb_submit_urb() failed. (ret: %d)\n", ret);
 }
@@ -512,11 +510,11 @@ static void it930x_usb_complete(struct urb *urb)
 	}
 
 	if (urb->actual_length)
-		ret = ctx->on_stream(ctx->ctx, urb->transfer_buffer, urb->actual_length);
+		ret = ctx->stream_handler(ctx->ctx, urb->transfer_buffer, urb->actual_length);
 	else
 		dev_dbg(ctx->bus->dev, "it930x_usb_complete: !urb->actual_length\n");
 
-	if (!ret && (atomic_read(&ctx->start) == 1)) {
+	if (!ret && (atomic_read(&ctx->start) >= 1)) {
 #ifdef IT930X_BUS_USE_WORKQUEUE
 		ret = queue_work(ctx->wq, &w->work);
 		if (ret)
@@ -532,7 +530,7 @@ static void it930x_usb_complete(struct urb *urb)
 }
 #endif
 
-static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stream_t on_stream, void *context)
+static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_stream_handler_t stream_handler, void *context)
 {
 	int ret = 0;
 
@@ -546,7 +544,7 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 	struct it930x_usb_work *works;
 #endif
 
-	if (!on_stream)
+	if (!stream_handler)
 		return -EINVAL;
 
 	dev_dbg(bus->dev, "it930x_usb_start_streaming\n");
@@ -562,11 +560,12 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 	no_dma = bus->usb.streaming_no_dma;
 #endif
 	
-	ctx->on_stream = on_stream;
+	ctx->stream_handler = stream_handler;
 	ctx->ctx = context;
 
 #if !defined(__FreeBSD__)
-	works = kcalloc(n, sizeof(*works), GFP_ATOMIC);
+	works = kcalloc(n, sizeof(*works), GFP_KERNEL);
+	
 	if (!works) {
 		ret = -ENOMEM;
 		goto fail;
@@ -577,7 +576,7 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 		void *p;
 		dma_addr_t dma;
 
-		urb = usb_alloc_urb(0, GFP_ATOMIC | __GFP_ZERO);
+		urb = usb_alloc_urb(0, GFP_KERNEL | __GFP_ZERO);
 		if (!urb) {
 			dev_err(bus->dev, "it930x_usb_start_streaming: usb_alloc_urb() failed. (i: %u)\n", i);
 			break;
@@ -585,12 +584,12 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 
 		if (!no_dma)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,34)
-			p = usb_alloc_coherent(dev, l, GFP_ATOMIC, &dma);
+			p = usb_alloc_coherent(dev, l, GFP_KERNEL, &dma);
 #else
-			p = usb_buffer_alloc(dev, l, GFP_ATOMIC, &dma);
+			p = usb_buffer_alloc(dev, l, GFP_KERNEL, &dma);
 #endif
 		else
-			p = kmalloc(l, GFP_ATOMIC);
+			p = kmalloc(l, GFP_KERNEL);
 
 		if (!p) {
 			if (!no_dma)
@@ -639,7 +638,7 @@ static int it930x_usb_start_streaming(struct it930x_bus *bus, it930x_bus_on_stre
 	usb_reset_endpoint(dev, 0x84);
 	
 	for (i = 0; i < n; i++) {
-		ret = usb_submit_urb(works[i].urb, GFP_ATOMIC);
+		ret = usb_submit_urb(works[i].urb, GFP_KERNEL);
 		if (ret) {
 			int j;
 
@@ -681,8 +680,8 @@ fail:
 
 	if (works)
 		kfree(works);
-	
-	ctx->on_stream = NULL;
+
+	ctx->stream_handler = NULL;
 	ctx->ctx = NULL;
 	ctx->num_urb = 0;
 	ctx->no_dma = false;
@@ -735,7 +734,7 @@ static int it930x_usb_stop_streaming(struct it930x_bus *bus)
 	}
 #endif
 	
-	ctx->on_stream = NULL;
+	ctx->stream_handler = NULL;
 	ctx->ctx = NULL;
 #if !defined(__FreeBSD__)
 	ctx->num_urb = 0;
@@ -765,7 +764,7 @@ int it930x_bus_init(struct it930x_bus *bus)
 		} else {
 			struct it930x_usb_context *ctx;
 
-			ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+			ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
 			if (!ctx) {
 				ret = -ENOMEM;
 				break;
@@ -776,7 +775,7 @@ int it930x_bus_init(struct it930x_bus *bus)
 #endif
 			
 			ctx->bus = bus;
-			ctx->on_stream = NULL;
+			ctx->stream_handler = NULL;
 			ctx->ctx = NULL;
 #if !defined(__FreeBSD__)
 			ctx->num_urb = 0;

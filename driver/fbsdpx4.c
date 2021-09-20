@@ -34,22 +34,16 @@
 
 #include "px4_misc.h"
 
-#include "px4.h"
+#include "firmware.h"
 #include "fbsdpx4.h"
 #include "revision.h"
 #include "ptx_ioctl.h"
 #include "i2c_comm.h"
-#include "it930x-config.h"
 #include "it930x-bus.h"
 #include "it930x.h"
 #include "tc90522.h"
 #include "r850.h"
 #include "rt710.h"
-//#include "ringbuffer.h"
-
-#if !defined(FIRMWARE_FILENAME)
-#define FIRMWARE_FILENAME	"it930x-firmware.bin"
-#endif
 
 #if !defined(MAX_DEVICE) || !MAX_DEVICE
 #undef MAX_DEVICE
@@ -73,7 +67,7 @@
 #define PX4_MAX_DEV 4
 #define FIFO_NO_SPACE_PROHIBIT (500)
 
-#define CONTINUITY_COUNTER_CHCEK
+//#define CONTINUITY_COUNTER_CHECK
 
 struct px4_tsdev {
 	struct sx xlock;
@@ -101,7 +95,7 @@ struct px4_tsdev {
 	unsigned int  discard_ts_packets;
 	unsigned long int ts_packet_count;  // 8byte
 	unsigned int  no_space_count;
-#ifdef CONTINUITY_COUNTER_CHCEK
+#ifdef CONTINUITY_COUNTER_CHECK
 	char continuity_counter[0x2000];
 #endif
 };
@@ -124,8 +118,6 @@ struct px4_softc {
 	struct sx xlock;
 	struct usb_callout sc_watchdog;
 	uint8_t sc_iface_num;
-	struct usb_fifo_sc sc_fifo[ TSDEV_NUM ];
-	struct px4_tsdev tsdev[TSDEV_NUM];
 	uint8_t sc_previous_status;
 	int dev_idx;
 	atomic_t ref;				// reference counter
@@ -138,12 +130,10 @@ struct px4_softc {
 	struct it930x_bridge it930x;
 	unsigned int lnb_power_count;
 	unsigned int streaming_count;
+	struct px4_tsdev tsdev[TSDEV_NUM];
+	struct usb_fifo_sc sc_fifo[ TSDEV_NUM ];
 	struct px4_stream_context *stream_context;
 	struct cdev cdev;
-#ifdef PSB_DEBUG
-	struct workqueue_struct *wq;
-	struct delayed_work w;
-#endif
 };
 
 // for PX-Q3U4 and PX-Q3PE4
@@ -174,13 +164,12 @@ static unsigned int usb_max_packets = 816;
 static unsigned int usb_max_mbufs = 6;
 static unsigned int tsdev_max_packets = 2048;
 static bool disable_multi_device_power_control = true;
-static bool s_agc_negative_mode = false;
-static bool s_vga_atten = false;
-static unsigned int s_fine_gain = 3;
+bool s_tuner_no_sleep = false;
 //unsigned int px4_debug = 4;
 unsigned int px4_debug = 7;
 static unsigned int discard_ts_packets = 1024;
 //static unsigned int discard_ts_packets = 0;
+
 
 static struct usb_fifo_methods px4_fifo_methods = {
 	.f_open = &px4_tsdev_open,
@@ -309,9 +298,6 @@ static int px4_init(struct px4_softc *px4)
 
 	cv_init(&px4->wait_cv, "px4");
 	mutex_init(&px4->wait_mtx);
-#if !defined(__FreeBSD__)
-	init_waitqueue_head(&px4->wait);
-#endif
 	sx_init(&px4->xlock, "px4->xlock");
 	
 	px4->lnb_power_count = 0;
@@ -346,15 +332,6 @@ static int px4_init(struct px4_softc *px4)
 
 static int px4_term(struct px4_softc *px4)
 {
-#if !defined(__FreeBSD__)
-	int i;
-
-	for (i = 0; i < TSDEV_NUM; i++) {
-		struct px4_tsdev *tsdev = &px4->tsdev[i];
-
-		ringbuffer_destroy(tsdev->ringbuf);
-	}
-#endif
 
 	cv_destroy( &px4->wait_cv );
 	mtx_destroy( &px4->wait_mtx );
@@ -395,10 +372,10 @@ static int px4_load_config(struct px4_softc *px4)
 	px4->tsdev[2].isdb = ISDB_T;
 	px4->tsdev[3].isdb = ISDB_T;
 
-	it930x->config.input[0].i2c_addr = 0x22;
-	it930x->config.input[1].i2c_addr = 0x26;
-	it930x->config.input[2].i2c_addr = 0x20;
-	it930x->config.input[3].i2c_addr = 0x24;
+	it930x->config.input[0].i2c_addr = 0x11;
+	it930x->config.input[1].i2c_addr = 0x13;
+	it930x->config.input[2].i2c_addr = 0x10;
+	it930x->config.input[3].i2c_addr = 0x12;
 
 	for (i = 0; i < TSDEV_NUM; i++) {
 		struct it930x_stream_input *input = &it930x->config.input[i];
@@ -413,7 +390,7 @@ static int px4_load_config(struct px4_softc *px4)
 		input->sync_byte = ((i + 1) << 4) | 0x07;	// 0x17 0x27 0x37 0x47
 
 		tsdev->tc90522.dev = dev;
-		tsdev->tc90522.i2c = &it930x->i2c_master[0];
+		tsdev->tc90522.i2c = &it930x->i2c_master[1];
 		tsdev->tc90522.i2c_addr = input->i2c_addr;
 		tsdev->tc90522.is_secondary = (i % 2) ? true : false;
 
@@ -422,7 +399,14 @@ static int px4_load_config(struct px4_softc *px4)
 			tsdev->t.rt710.dev = dev;
 			tsdev->t.rt710.i2c = &tsdev->tc90522.i2c_master;
 			tsdev->t.rt710.i2c_addr = 0x7a;
+			tsdev->t.rt710.config.xtal = 24000;
 			tsdev->t.rt710.config.loop_through = false;
+			tsdev->t.rt710.config.clock_out = false;
+			tsdev->t.rt710.config.signal_output_mode = RT710_SIGNAL_OUTPUT_DIFFERENTIAL;
+			tsdev->t.rt710.config.agc_mode = RT710_AGC_POSITIVE;
+			tsdev->t.rt710.config.vga_atten_mode = RT710_VGA_ATTEN_OFF;
+			tsdev->t.rt710.config.fine_gain = RT710_FINE_GAIN_3DB;
+			tsdev->t.rt710.config.scan_mode = RT710_SCAN_MANUAL;
 			break;
 
 		case ISDB_T:
@@ -439,50 +423,65 @@ static int px4_load_config(struct px4_softc *px4)
 	}
 
 	it930x->config.input[4].enable = false;
+	it930x->config.input[4].port_number = 0;
 
 	return 0;
 }
 
 static int px4_set_power(struct px4_softc *px4, bool on)
 {
-	int ret = 0, i;
+	int ret = 0, i, last_power_count = 0;
 	struct it930x_bridge *it930x = &px4->it930x;
 	struct px4_multi_device *multi_dev = px4->multi_dev;
 
 	dev_dbg(px4->dev, "px4_set_power: %s\n", on ? "on" : "off");
 
+	if (multi_dev) {
+		mutex_lock(&multi_dev->lock);
+
+		dev_dbg(px4->dev, "px4_set_power: power_count: %d\n", multi_dev->power_count);
+		last_power_count = multi_dev->power_count;
+	}
+
 	if (on) {
 		if (multi_dev) {
-			mutex_lock(&multi_dev->lock);
-
 			if (!multi_dev->power_count) {
 				for (i = 0; i < 2; i++) {
-					if (multi_dev->devs[i]) {
-						dev_dbg(multi_dev->devs[i]->dev, "px4_set_power: dev %u: gpioh7 low\n", multi_dev->devs[i]->dev_id);
+					if (!multi_dev->devs[i])
+						continue;
 
-						ret = it930x_write_gpio(&multi_dev->devs[i]->it930x, 7, false);
-						if (ret)
-							break;
-					}
+					dev_dbg(multi_dev->devs[i]->dev, "px4_set_power: dev %u: gpioh7 low\n", multi_dev->devs[i]->dev_id);
+
+					ret = it930x_write_gpio(&multi_dev->devs[i]->it930x, 7, false);
+					if (ret)
+						goto exit;
+
+					msleep(75);
+
+					dev_dbg(multi_dev->devs[i]->dev, "px4_set_power: dev %u: gpioh2 high\n", multi_dev->devs[i]->dev_id);
+
+					ret = it930x_write_gpio(&multi_dev->devs[i]->it930x, 2, true);
+					if (ret)
+						goto exit;
+
+					msleep(20);
 				}
 			}
 
 			multi_dev->power_count++;
-
-			mutex_unlock(&multi_dev->lock);
 		} else {
 			ret = it930x_write_gpio(it930x, 7, false);
 			if (ret)
 				goto exit;
-		}
-		
-		msleep( 100 );
-		
-		ret = it930x_write_gpio(it930x, 2, true);
-		if (ret)
-			goto exit;
 
-		msleep( 20 );
+			msleep(100);
+
+			ret = it930x_write_gpio(it930x, 2, true);
+			if (ret)
+				goto exit;
+
+			msleep(20);
+		}
 
 		for (i = 0; i < TSDEV_NUM; i++) {
 			struct px4_tsdev *t = &px4->tsdev[i];
@@ -533,35 +532,44 @@ static int px4_set_power(struct px4_softc *px4, bool on)
 			tc90522_term(&t->tc90522);
 		}
 
-		it930x_write_gpio(it930x, 2, false);
-
 		if (multi_dev) {
-			mutex_lock(&multi_dev->lock);
-
 			multi_dev->power_count--;
 
 			if (!multi_dev->power_count) {
 				for (i = 0; i < 2; i++) {
-					if (multi_dev->devs[i]) {
-						dev_dbg(multi_dev->devs[i]->dev, "px4_set_power: dev %u: gpioh7 high\n", multi_dev->devs[i]->dev_id);
+					if (!multi_dev->devs[i])
+						continue;
 
-						it930x_write_gpio(&multi_dev->devs[i]->it930x, 7, true);
-					}
+					dev_dbg(multi_dev->devs[i]->dev, "px4_set_power: dev %u: gpioh2 low\n", multi_dev->devs[i]->dev_id);
+					it930x_write_gpio(&multi_dev->devs[i]->it930x, 2, false);
+
+					dev_dbg(multi_dev->devs[i]->dev, "px4_set_power: dev %u: gpioh7 high\n", multi_dev->devs[i]->dev_id);
+					it930x_write_gpio(&multi_dev->devs[i]->it930x, 7, true);
 				}
 			}
-
-			mutex_unlock(&multi_dev->lock);
-		} else
+		} else {
+			it930x_write_gpio(it930x, 2, false);
 			it930x_write_gpio(it930x, 7, true);
+		}
 
-		msleep( 50 );
+		msleep(50);
 	}
 
 exit:
-	if (ret)
+	if (ret) {
+		if (multi_dev) {
+			if (multi_dev->power_count > last_power_count)
+				multi_dev->power_count--;
+			else if (multi_dev->power_count < last_power_count)
+				multi_dev->power_count++;
+		}
+
 		dev_err(px4->dev, "px4_set_power: failed.\n");
-	else
+	} else
 		dev_dbg(px4->dev, "px4_set_power: ok\n");
+
+	if (multi_dev)
+		mutex_unlock(&multi_dev->lock);
 
 	return ret;
 }
@@ -705,7 +713,7 @@ static void px4_ts_write(struct px4_tsdev **ptsdev, u8 **buf, u32 *len )
 					tsdev->ts_packet_count++;
 					
 					if( !tsdev->discard_ts_packets ){
-#ifdef CONTINUITY_COUNTER_CHCEK
+#ifdef CONTINUITY_COUNTER_CHECK
 						u32 pid;
 						u32 adaptation_field_control;
 						u32 current;
@@ -859,7 +867,7 @@ static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, struct usb_p
 					}
 					tsdev->ts_packet_count++;
 					if( !tsdev->discard_ts_packets ){
-#ifdef CONTINUITY_COUNTER_CHCEK
+#ifdef CONTINUITY_COUNTER_CHECK
 						u32 pid;
 						u32 adaptation_field_control;
 						u32 current;
@@ -955,7 +963,7 @@ static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, struct usb_p
 	return;
 }
 
-static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
+static int px4_stream_handler(void *context, struct usb_page_cache *pc, u32 len)
 {
 	struct px4_stream_context *stream_context = context;
 	u8 *context_remain_buf = stream_context->remain_buf;
@@ -1048,13 +1056,13 @@ static int px4_on_stream(void *context, struct usb_page_cache *pc, u32 len)
 	return 0;
 }
 
-struct tc90522_regbuf tc_init_s[] = {
+static struct tc90522_regbuf tc_init_s[] = {
 	{ 0x15, NULL, { 0x00 } },
 	{ 0x1d, NULL, { 0x00 } },
 	{ 0x04, NULL, { 0x02 } }
 };
 
-struct tc90522_regbuf tc_init_t[] = {
+static struct tc90522_regbuf tc_init_t[] = {
 	{ 0xb0, NULL, { 0xa0 } },
 	{ 0xb2, NULL, { 0x3d } },
 	{ 0xb3, NULL, { 0x25 } },
@@ -1081,9 +1089,9 @@ static int px4_tsdev_init(struct px4_tsdev *tsdev)
 	switch (tsdev->isdb) {
 	case ISDB_S:
 	{
-		ret = tc90522_write_regs(tc90522, tc_init_s, ARRAY_SIZE(tc_init_s));
+		ret = tc90522_write_multiple_regs(tc90522, tc_init_s, ARRAY_SIZE(tc_init_s));
 		if (ret) {
-			dev_err(px4->dev, "px4_tsdev_init %d:%u: tc90522_write_regs(tc_init_s) failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
+			dev_err(px4->dev, "px4_tsdev_init %d:%u: tc90522_write_multiple_regs(tc_init_s) failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
 			break;
 		}
 
@@ -1108,9 +1116,9 @@ static int px4_tsdev_init(struct px4_tsdev *tsdev)
 	{
 		struct r850_system_config sys;
 
-		ret = tc90522_write_regs(tc90522, tc_init_t, ARRAY_SIZE(tc_init_t));
+		ret = tc90522_write_multiple_regs(tc90522, tc_init_t, ARRAY_SIZE(tc_init_t));
 		if (ret) {
-			dev_err(px4->dev, "px4_tsdev_init %d:%u: tc90522_write_regs(tc_init_t) failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
+			dev_err(px4->dev, "px4_tsdev_init %d:%u: tc90522_write_multiple_regs(tc_init_t) failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
 			break;
 		}
 
@@ -1146,14 +1154,12 @@ static int px4_tsdev_init(struct px4_tsdev *tsdev)
 
 		break;
 	}
-	
+
 	default:
 		ret = -EIO;
 		break;
 	}
 
-	tsdev->freq= 0;
-	
 	if (!ret)
 		tsdev->init = true;
 
@@ -1169,7 +1175,9 @@ static void px4_tsdev_term(struct px4_tsdev *tsdev)
 
 	switch (tsdev->isdb) {
 	case ISDB_S:
-		rt710_sleep(&tsdev->t.rt710);
+		if (!s_tuner_no_sleep)
+			rt710_sleep(&tsdev->t.rt710);
+
 		tc90522_sleep_s(tc90522, true);
 		break;
 
@@ -1191,7 +1199,6 @@ static void px4_tsdev_term(struct px4_tsdev *tsdev)
 static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 {
 	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
-	
 	int ret = 0, dev_idx = px4->dev_idx;
 	unsigned int tsdev_id = tsdev->id;
 	struct tc90522_demod *tc90522 = &tsdev->tc90522;
@@ -1224,12 +1231,6 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			break;
 		}
 
-		rt710->config.agc_mode = (s_agc_negative_mode) ? RT710_AGC_NEGATIVE : RT710_AGC_POSITIVE;
-		rt710->config.vga_atten_mode = (s_vga_atten) ? RT710_VGA_ATTEN_ON : RT710_VGA_ATTEN_OFF;
-		rt710->config.fine_gain = (s_fine_gain < 0 || s_fine_gain > 3) ? (RT710_FINE_GAIN_3DB) : (3 - s_fine_gain);
-
-		dev_dbg(px4->dev, "px4_tsdev_set_channel %d:%u: rt710: agc_mode: %d, vga_atten_mode: %d, fine_gain: %d\n", dev_idx, tsdev_id, rt710->config.agc_mode, rt710->config.vga_atten_mode, rt710->config.fine_gain);
-
 		// set frequency
 
 		ret = tc90522_set_agc_s(tc90522, false);
@@ -1260,7 +1261,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tuner_locked)
 				break;
 
-			msleep( 10 );
+			msleep(10);
 		}
 
 		if (ret) {
@@ -1291,7 +1292,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && demod_locked)
 				break;
 
-			msleep( 10 );
+			msleep(10);
 		}
 
 		if (ret) {
@@ -1314,7 +1315,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if ((!ret && tsid) || ret == -EINVAL)
 				break;
 
-			msleep( 10 );
+			msleep(10);
 		}
 
 		if (ret) {
@@ -1343,7 +1344,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tsid2 == tsid)
 				break;
 
-			msleep( 10 );
+			msleep(10);
 		}
 
 		dev_dbg(px4->dev, "px4_tsdev_set_channel %d:%u: tc90522_get_tsid_s() tsid2: 0x%04x, count: %d\n", dev_idx, tsdev_id, tsid2, i);
@@ -1408,7 +1409,7 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && tuner_locked)
 				break;
 
-			msleep( 10 );
+			msleep(10);
 		}
 
 		if (ret) {
@@ -1453,9 +1454,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			if (!ret && demod_locked)
 				break;
 
-			msleep( 10 );
+			msleep(10);
 		}
-		
+
 		if (ret) {
 			dev_err(px4->dev, "px4_tsdev_set_channel %d:%u: tc90522_is_signal_locked_t() failed. (ret: %d)\n", dev_idx, tsdev_id, ret);
 			break;
@@ -1468,9 +1469,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 			break;
 		}
 
-		if (i > 265){
-			msleep( (i - 265) * 10 );
-		}
+		if (i > 265)
+			msleep((i - 265) * 10);
+
 		break;
 	}
 
@@ -1487,37 +1488,9 @@ static int px4_tsdev_set_channel(struct px4_tsdev *tsdev, struct ptx_freq *freq)
 	return ret;
 }
 
-#ifdef PSB_DEBUG
-static void px4_workqueue_handler(struct work_struct *w)
-{
-	int ret = 0;
-	struct px4_device *px4 = container_of(to_delayed_work(w), struct px4_device, w);
-	struct it930x_bridge *it930x = &px4->it930x;
-	struct it930x_regbuf regbuf[1];
-	u8 val[2];
-
-	it930x_regbuf_set_buf(&regbuf[0], 0xda98, val, 2);
-	ret = it930x_read_regs(it930x, regbuf, 1);
-	if (ret)
-		goto exit;
-
-	dev_info(px4->dev, "psb count: 0x%x\n", (val[0] | (val[1] << 8)));
-
-	mutex_lock(&px4->lock);
-
-	if (px4->streaming_count)
-		queue_delayed_work(px4->wq, to_delayed_work(w), msecs_to_jiffies(1000));
-
-	mutex_unlock(&px4->lock);
-
-	return;
-}
-#endif
-
 static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 {
 	int ret = 0;
-	
 	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	struct it930x_bus *bus = &px4->it930x.bus;
 	struct tc90522_demod *tc90522 = &tsdev->tc90522;
@@ -1527,38 +1500,17 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		// already started
 		return 0;
 
-	//#if !defined(__FreeBSD__)
 	atomic_set(&tsdev->streaming, 1);
-	//#endif
-	
+
 #if !defined(__FreeBSD__)
 	mutex_lock(&px4->lock);
 #endif
 
 	if (!px4->streaming_count) {
 		
-#if defined(__FreeBSD__)
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: streaming_usb_buffer_size: %u\n", px4->dev_idx, tsdev->id, bus->usb.streaming_usb_buffer_size );
-#else		
-		bus->usb.streaming_urb_buffer_size = 188 * urb_max_packets;
-		bus->usb.streaming_urb_num = max_urbs;
-		bus->usb.streaming_no_dma = no_dma;
-
-		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: urb_buffer_size: %u, urb_num: %u, no_dma: %c\n", px4->dev_idx, tsdev->id, bus->usb.streaming_urb_buffer_size, bus->usb.streaming_urb_num, (bus->usb.streaming_no_dma) ? 'Y' : 'N');
-
-		ret = it930x_purge_psb(&px4->it930x, psb_purge_timeout);
-		if (ret) {
-			dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: it930x_purge_psb() failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
-			goto fail;
-		}
-#endif
 	}
 
-#if !defined(__FreeBSD__)
-	ringbuffer_size = 188 * tsdev_max_packets;
-	dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: size of ringbuffer: %u\n", px4->dev_idx, tsdev->id, ringbuffer_size);
-#endif
-	
 	switch (tsdev->isdb) {
 	case ISDB_S:
 		// enable ts pins
@@ -1586,48 +1538,24 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		ret = -EIO;
 		break;
 	}
-	
+
 	if (ret)
 		goto fail;
 
-#if !defined(__FreeBSD__)
-	ret = ringbuffer_alloc(tsdev->ringbuf, ringbuffer_size);
-	if (ret)
-		goto fail;
-
-	ret = ringbuffer_start(tsdev->ringbuf);
-	if (ret)
-		goto fail;
-#endif
-	
 	if (!px4->streaming_count) {
 		px4->stream_context->remain_len = 0;
 		px4->stream_context->sync_flag = 0;
 		px4->stream_context->resync_count = 0;
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: starting...\n", px4->dev_idx, tsdev->id);
-		ret = it930x_bus_start_streaming(bus, px4_on_stream, px4->stream_context);
-
-
+		ret = it930x_bus_start_streaming(bus, px4_stream_handler, px4->stream_context);
 		if (ret) {
 			dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: it930x_bus_start_streaming() failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
 			goto fail_after_ringbuffer;
 		}
 		usbd_transfer_start( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 
-#ifdef PSB_DEBUG
-		INIT_DELAYED_WORK(&px4->w, px4_workqueue_handler);
-
-		if (!px4->wq)
-			px4->wq = create_singlethread_workqueue("px4_workqueue");
-
-		if (px4->wq)
-			queue_delayed_work(px4->wq, &px4->w, msecs_to_jiffies(1000));
-#endif
 	}
 
-#if defined(__FreeBSD__)
-	//atomic_set(&tsdev->streaming, 1);
-#endif
 	px4->streaming_count++;
 	streaming_count = px4->streaming_count;
 
@@ -1647,7 +1575,7 @@ fail:
 	atomic_set(&tsdev->streaming, 0);
 
 	dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
-	
+
 	return ret;
 }
 
@@ -1678,14 +1606,6 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 
 		usbd_transfer_stop( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 		
-#ifdef PSB_DEBUG
-		if (px4->wq) {
-			cancel_delayed_work_sync(&px4->w);
-			flush_workqueue(px4->wq);
-			destroy_workqueue(px4->wq);
-			px4->wq = NULL;
-		}
-#endif
 	}
 	streaming_count = px4->streaming_count;
 
@@ -1715,9 +1635,9 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 		ret = -EIO;
 		break;
 	}
-	
+
 	dev_dbg(px4->dev, "px4_tsdev_stop_streaming %d:%u: streaming_count: %u\n", px4->dev_idx, tsdev->id, streaming_count);
-	
+
 	return ret;
 }
 
@@ -1991,16 +1911,15 @@ static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS)
 	return sysctl_handle_int(oidp, NULL, cn, req);
 }
 
-struct tc90522_regbuf tc_init_s0[] = {
+static struct tc90522_regbuf tc_init_s0[] = {
 	{ 0x07, NULL, { 0x31 } },
 	{ 0x08, NULL, { 0x77 } }
 };
 
-struct tc90522_regbuf tc_init_t0[] = {
+static struct tc90522_regbuf tc_init_t0[] = {
 	{ 0x0e, NULL, { 0x77 } },
 	{ 0x0f, NULL, { 0x13 } }
 };
-
 
 static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 {
@@ -2015,16 +1934,16 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	unsigned int bufsize;
 
 #if defined(__FreeBSD__)
-	sx_xlock(&px4->xlock);
-	//sx_xlock(&glock);
+	//sx_xlock(&px4->xlock);
+	sx_xlock(&glock);
 #else
 	mutex_lock(&glock);
 #endif	
 	if (!atomic_read(&px4->avail)) {
 		// not available
 #if defined(__FreeBSD__)
-		//sx_xunlock(&glock);
-		sx_xunlock(&px4->xlock);
+		sx_xunlock(&glock);
+		//sx_xunlock(&px4->xlock);
 #else
 		mutex_unlock(&glock);
 #endif
@@ -2035,7 +1954,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	
 #if defined(__FreeBSD__)
 	sx_xlock(&tsdev->xlock);
-	//sx_xunlock(&glock);
+	sx_xunlock(&glock);
 #else
 	mutex_lock(&tsdev->lock);
 	mutex_unlock(&glock);
@@ -2052,8 +1971,10 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 
 		goto fail;
 	}
-	
-#if !defined(__FreeBSD__)
+
+#if defined(__FreeBSD__)
+	sx_xlock(&px4->xlock);
+#else
 	mutex_lock(&px4->lock);
 #endif
 	
@@ -2061,6 +1982,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	if (ref <= 1) {
 		ret = -ECANCELED;
 #if defined(__FreeBSD__)
+		sx_xunlock(&px4->xlock);
 		sx_xunlock(&tsdev->xlock);
 #else
 		mutex_unlock(&px4->lock);
@@ -2089,10 +2011,12 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 			if (!t->open) {
 				switch (t->isdb) {
 				case ISDB_S:
-					ret = rt710_sleep(&t->t.rt710);
-					if (ret) {
-						dev_err(px4->dev, "px4_tsdev_open %d:%u: rt710_sleep(%d) failed. (ret: %d)\n", dev_idx, tsdev_id, i, ret);
-						break;
+					if (!s_tuner_no_sleep) {
+						ret = rt710_sleep(&t->t.rt710);
+						if (ret) {
+							dev_err(px4->dev, "px4_tsdev_open %d:%u: rt710_sleep(%d) failed. (ret: %d)\n", dev_idx, tsdev_id, i, ret);
+							break;
+						}
 					}
 
 					ret = tc90522_sleep_s(&t->tc90522, true);
@@ -2139,16 +2063,16 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 
 	if (ref == 2) {
 		// S0
-		ret = tc90522_write_regs(&px4->tsdev[0].tc90522, tc_init_s0, ARRAY_SIZE(tc_init_s0));
+		ret = tc90522_write_multiple_regs(&px4->tsdev[0].tc90522, tc_init_s0, ARRAY_SIZE(tc_init_s0));
 		if (ret) {
-			dev_err(px4->dev, "px4_tsdev_open %d:%u: tc90522_write_regs(tc_init_s0) failed.\n", dev_idx, tsdev_id);
+			dev_err(px4->dev, "px4_tsdev_open %d:%u: tc90522_write_multiple_regs(tc_init_s0) failed.\n", dev_idx, tsdev_id);
 			goto fail_after_power;
 		}
 
 		// T0
-		ret = tc90522_write_regs(&px4->tsdev[2].tc90522, tc_init_t0, ARRAY_SIZE(tc_init_t0));
+		ret = tc90522_write_multiple_regs(&px4->tsdev[2].tc90522, tc_init_t0, ARRAY_SIZE(tc_init_t0));
 		if (ret) {
-			dev_err(px4->dev, "px4_tsdev_open %d:%u: tc90522_write_regs(tc_init_t0) failed.\n", dev_idx, tsdev_id);
+			dev_err(px4->dev, "px4_tsdev_open %d:%u: tc90522_write_multiple_regs(tc_init_t0) failed.\n", dev_idx, tsdev_id);
 			goto fail_after_power;
 		}
 	}
@@ -2178,7 +2102,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	dev_info( px4->dev,"px4_tsdev_open %d:%u: usb_max_mbufs=%u, buffsize=%u, tsdev_max_packets=%u\n", dev_idx, tsdev_id, usb_max_mbufs, bufsize, tsdev_max_packets );
 
 	tsdev->no_space_count = 0;
-#ifdef  CONTINUITY_COUNTER_CHCEK
+#ifdef  CONTINUITY_COUNTER_CHECK
 	{
 		u32 count;
 		for( count = 0; count < 0x2000; count++){
@@ -2201,8 +2125,8 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
 	}
 	
-	sx_xunlock(&tsdev->xlock);
 	sx_xunlock(&px4->xlock);
+	sx_xunlock(&tsdev->xlock);
 #else
 	mutex_unlock(&px4->lock);
 	mutex_unlock(&tsdev->lock);
@@ -2219,6 +2143,7 @@ fail_after_power:
 fail_after_ref:
 	px4_unref(px4);
 #if defined(__FreeBSD__)
+	sx_xunlock(&px4->xlock);
 	sx_xunlock(&tsdev->xlock);
 #else
 	mutex_unlock(&px4->lock);
@@ -2226,7 +2151,7 @@ fail_after_ref:
 #endif
 fail:
 #if defined(__FreeBSD__)
-	sx_xunlock(&px4->xlock);
+	//sx_xunlock(&px4->xlock);
 #endif
 	dev_err(px4->dev, "px4_tsdev_open %d:%u: failed. (ret: %d)\n", dev_idx, tsdev_id, ret);
 
@@ -2237,14 +2162,15 @@ fail:
 static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 {
 	int avail, ref;
+	struct px4_softc *px4;
 	struct px4_tsdev *tsdev =usb_fifo_softc( fifo );
-	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	
 	if (!tsdev) {
 		pr_err("px4_tsdev_release: tsdev is NULL.\n");
-		return ;
+		return;
 	}
-	
+
+	px4 = container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 	avail = atomic_read(&px4->avail);
 
 	dev_dbg(px4->dev, "px4_tsdev_release %d:%u: avail: %d\n", px4->dev_idx, tsdev->id, avail);
@@ -2286,11 +2212,11 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 	
 	if (avail)
 		px4_tsdev_term(tsdev);
-	
+
 	ref = px4_unref(px4);
 	if (avail && ref <= 1)
 		px4_set_power(px4, false);
-	
+
 #if defined(__FreeBSD__)
 	sx_xunlock(&px4->xlock);
 #else
@@ -2314,7 +2240,7 @@ static void px4_tsdev_release(struct usb_fifo *fifo, int fflags)
 		dev_dbg(px4->dev, "px4_tsdev_release %d:%u: no space count= %u\n", px4->dev_idx, tsdev->id, tsdev->no_space_count);
 	dev_dbg(px4->dev, "px4_tsdev_release %d:%u: ok. ref count: %d\n", px4->dev_idx, tsdev->id, ref);
 
-	return ;
+	return;
 }
 
 static void px4_tsdev_start_read( struct usb_fifo *fifo )
@@ -2530,6 +2456,7 @@ static int px4_attach(device_t dev)
 	int ret = 0;
 	int dev_idx;
 	int i, multi_devs_idx = -1;
+	int last_power_count = 0;
 	const char *serial_str;
 	
 	struct it930x_bridge *it930x;
@@ -2570,6 +2497,7 @@ static int px4_attach(device_t dev)
 		ret = -ENOMEM;
 		goto fail_before_base;
 	}
+
 	px4->dev = dev;
 	px4->usbdev = uaa->device;
 	device_set_usb_desc(dev);
@@ -2587,32 +2515,32 @@ static int px4_attach(device_t dev)
 			dev_err(dev, "px4_probe: strict_strtoull() failed.\n");
 		else {
 			px4->dev_id = px4->serial_number % 16;
-			
+
 			dev_dbg(dev, "px4_probe: serial_number: %014llx\n", px4->serial_number);
 			dev_dbg(dev, "px4_probe: dev_id: %u\n", px4->dev_id);
-			
+
 			if (px4->dev_id != 1 && px4->dev_id != 2)
 				dev_warn(dev, "px4_probe: Unexpected device id: %u\n", px4->dev_id);
 		}
 	} else
 		dev_warn(dev, "px4_probe: Invalid serial number length.\n");
-	
+
 	if (uaa->info.idVendor == 0x0511 &&
 		(uaa->info.idProduct == PID_PX_Q3U4 || uaa->info.idProduct == PID_PX_Q3PE4)) {
 		if (disable_multi_device_power_control)
 			dev_info(dev, "Multi device power control: disabled\n");
 		else {
 			int multi_dev_idx = -1;
-			
+
 			dev_info(dev, "Multi device power control: enabled\n");
-			
+
 			for (i = 0; i < MAX_DEVICE; i++) {
 				if (devs[i] != NULL && devs[i]->serial_number == px4->serial_number) {
 					multi_dev_idx = i;
 					break;
 				}
 			}
-			
+
 			if (multi_dev_idx != -1) {
 				px4->multi_dev = devs[multi_dev_idx]->multi_dev;
 			} else {
@@ -2622,20 +2550,20 @@ static int px4_attach(device_t dev)
 					ret = -ENOMEM;
 					goto fail_before_base;
 				}
-				
+
 				mutex_init(&px4->multi_dev->lock);
 			}
-			
+
 			if (px4->multi_dev) {
 				struct px4_multi_device *multi_dev = px4->multi_dev;
-				
+
 				mutex_lock(&multi_dev->lock);
-				
+
 				if (multi_dev->ref > 2)
 					px4->multi_dev = NULL;
 				else
 					multi_devs_idx = multi_dev->ref++;
-				
+
 				mutex_unlock(&multi_dev->lock);
 			}
 		}
@@ -2666,6 +2594,7 @@ found:
 	px4->sc_iface_num = idesc->bInterfaceNumber;
 
 	// Initialize px4 structure
+
 	ret = px4_init(px4);
 	if (ret)
 		goto fail_before_base;
@@ -2688,60 +2617,84 @@ found:
 	ret = it930x_bus_init(bus);
 	if (ret)
 		goto fail_before_bus;
-	
+
 	// Initialize bridge operator
-	
+
 	it930x->dev = dev;
 	it930x->config.xfer_size = 188 * xfer_packets;
-	it930x->config.i2c_speed = IT930X_I2C_SPEED;
-	
+	it930x->config.i2c_speed = 0x07;
+
 	ret = it930x_init(it930x);
 	if (ret)
 		goto fail_before_bridge;
-	
+
 	// Load config from eeprom
-	
+
 	ret = px4_load_config(px4);
 	if (ret)
 		goto fail;
-	
+
 	// Initialize IT930x bridge
-	
+
 	ret = it930x_load_firmware(it930x, FIRMWARE_FILENAME);
 	if (ret)
 		goto fail;
-	
+
 	ret = it930x_init_device(it930x);
 	if (ret)
 		goto fail;
-	
+
 	// GPIO configurations
-	
+
 	ret = it930x_set_gpio_mode(it930x, 7, IT930X_GPIO_OUT, true);
 	if (ret)
 		goto fail;
-	
-	if (px4->multi_dev && multi_devs_idx != -1) {
-		mutex_lock(&px4->multi_dev->lock);
-		
-		px4->multi_dev->devs[multi_devs_idx] = px4;
-		
-		ret = it930x_write_gpio(it930x, 7, (px4->multi_dev->power_count) ? false : true);
-		
-		mutex_unlock(&px4->multi_dev->lock);
-	} else
-		ret = it930x_write_gpio(it930x, 7, true);
-	
-	if (ret)
-		goto fail;
-	
+
 	ret = it930x_set_gpio_mode(it930x, 2, IT930X_GPIO_OUT, true);
 	if (ret)
 		goto fail;
-	
-	ret = it930x_write_gpio(it930x, 2, false);
-	if (ret)
-		goto fail;
+
+	if (px4->multi_dev && multi_devs_idx != -1) {
+		mutex_lock(&px4->multi_dev->lock);
+
+		last_power_count = px4->multi_dev->power_count;
+
+		if (px4->multi_dev->power_count) {
+			ret = it930x_write_gpio(it930x, 7, false);
+			if (ret)
+				goto fail;
+
+			msleep(75);
+
+			ret = it930x_write_gpio(it930x, 2, true);
+			if (ret)
+				goto fail;
+
+			msleep(20);
+
+			px4->multi_dev->power_count++;
+		} else {
+			ret = it930x_write_gpio(it930x, 7, true);
+			if (ret)
+				goto fail;
+
+			ret = it930x_write_gpio(it930x, 2, false);
+			if (ret)
+				goto fail;
+		}
+
+		px4->multi_dev->devs[multi_devs_idx] = px4;
+
+		mutex_unlock(&px4->multi_dev->lock);
+	} else {
+		ret = it930x_write_gpio(it930x, 7, true);
+		if (ret)
+			goto fail;
+
+		ret = it930x_write_gpio(it930x, 2, false);
+		if (ret)
+			goto fail;
+	}
 
 	ret = it930x_set_gpio_mode(it930x, 11, IT930X_GPIO_OUT, true);
 	if (ret)
@@ -2789,20 +2742,23 @@ fail_before_base:
 	if (px4) {
 		if (px4->multi_dev) {
 			struct px4_multi_device *multi_dev = px4->multi_dev;
-			
+
 			mutex_lock(&multi_dev->lock);
-			
+
+			if (multi_dev->power_count > last_power_count)
+				multi_dev->power_count--;
+
 			for (i = 0; i < 2; i++) {
 				if (multi_dev->devs[i] == px4)
 					multi_dev->devs[i] = NULL;
 			}
-			
+
 			if (!--multi_dev->ref)
 				kfree(multi_dev);
 			else
 				mutex_unlock(&multi_dev->lock);
 		}
-		
+
 		if (px4->stream_context)
 			kfree(px4->stream_context);
 	}
