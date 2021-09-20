@@ -238,7 +238,7 @@ static void px4_sysctl_init(void *p)
 
 	SYSCTL_ADD_PROC(scl, sol,
 					OID_AUTO, "usb_max_mbufs",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
-					px4, 0, px4_sysctl_usb_max_mbufs, "I", "Maximum number of USB mbufs" );	
+					px4, 0, px4_sysctl_usb_max_mbufs, "I", "Maximum number of USB mbufs" );
 
 	SYSCTL_ADD_PROC(scl, sol,
 					OID_AUTO, "discard_ts_packets",CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY,
@@ -2158,8 +2158,8 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 								   usb_max_mbufs );
 	
 	if ( error ) {
-	  ret= ENOMEM;
-	  goto fail_after_power;
+		ret= ENOMEM;
+		goto fail_after_power;
 	}
 	
 	bufsize = 188 * tsdev_max_packets * usb_max_mbufs;
@@ -2198,7 +2198,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	error = px4_tsdev_start_streaming( tsdev );
 	  
 	if(error){
-	  dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
 	}
 	
 	sx_xunlock(&tsdev->xlock);
@@ -2323,8 +2323,8 @@ static void px4_tsdev_start_read( struct usb_fifo *fifo )
 	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 
 	if( !atomic_read(&tsdev->ts_packet_read ) ){
-	  dev_dbg(px4->dev, "px4_tsdev_start_read %d:%u:\n", px4->dev_idx, tsdev->id);
-	  tsdev->discard_ts_packets = discard_ts_packets;
+		dev_dbg(px4->dev, "px4_tsdev_start_read %d:%u:\n", px4->dev_idx, tsdev->id);
+		tsdev->discard_ts_packets = discard_ts_packets;
 	}
 	
 	atomic_set(&tsdev->ts_packet_read, 1 );
@@ -2338,7 +2338,7 @@ static void px4_tsdev_stop_read( struct usb_fifo *fifo )
 	struct px4_softc *px4= container_of(tsdev, struct px4_softc, tsdev[tsdev->id]);
 
 	if( atomic_read(&tsdev->ts_packet_read ) ){
-	  dev_dbg(px4->dev, "px4_tsdev_stop_read %d:%u:\n", px4->dev_idx, tsdev->id);
+		dev_dbg(px4->dev, "px4_tsdev_stop_read %d:%u:\n", px4->dev_idx, tsdev->id);
 	}
 	atomic_set(&tsdev->ts_packet_read, 0 );
 	
@@ -2494,24 +2494,24 @@ static int px4_probe(device_t dev)
 		
 		pr_info( DEVICE_NAME
 #ifdef PX4_DRIVER_VERSION
-				" version " PX4_DRIVER_VERSION
+				 " version " PX4_DRIVER_VERSION
 #endif
 #ifdef REVISION_NUMBER
 #if defined(PX4_DRIVER_VERSION)
-				","
+				 ","
 #endif
-				" rev: " REVISION_NUMBER
+				 " rev: " REVISION_NUMBER
 #endif
 #ifdef COMMIT_HASH
 #if defined(PX4_DRIVER_VERSION) || defined(REVISION_NUMBER)
-				","
+				 ","
 #endif
-				" commit: " COMMIT_HASH
+				 " commit: " COMMIT_HASH
 #endif
 #ifdef REVISION_NAME
-				" @ " REVISION_NAME
+				 " @ " REVISION_NAME
 #endif
-				"\n");
+				 "\n");
 		
 		return BUS_PROBE_SPECIFIC;
 	}
@@ -2662,7 +2662,7 @@ static int px4_attach(device_t dev)
 	}
 	goto fail_before_base;
 	
- found:
+found:
 	px4->sc_iface_num = idesc->bInterfaceNumber;
 
 	// Initialize px4 structure
@@ -2775,17 +2775,17 @@ static int px4_attach(device_t dev)
 	
 	return 0;
 
- fail_fifo:
+fail_fifo:
 	for (i = 0; i < TSDEV_NUM; i++)
 		usb_fifo_detach( &px4->sc_fifo[i]);
 
- fail:
+fail:
 	it930x_term(it930x);
- fail_before_bridge:
+fail_before_bridge:
 	it930x_bus_term(bus);
- fail_before_bus:
+fail_before_bus:
 	px4_term(px4);
- fail_before_base:
+fail_before_base:
 	if (px4) {
 		if (px4->multi_dev) {
 			struct px4_multi_device *multi_dev = px4->multi_dev;
