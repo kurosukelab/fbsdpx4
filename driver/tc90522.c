@@ -8,7 +8,7 @@
 #if defined(__FreeBSD__)
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/mutex.h>
+#include <sys/sx.h>
 #include <sys/condvar.h>
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -71,11 +71,18 @@ int tc90522_read_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 len)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
-
+#endif
 	ret = _tc90522_read_regs(demod, reg, buf, len);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return ret;
 }
@@ -84,11 +91,19 @@ int tc90522_read_reg(struct tc90522_demod *demod, u8 reg, u8 *val)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
+#endif
 
 	ret = _tc90522_read_regs(demod, reg, val, 1);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return ret;
 }
@@ -100,7 +115,11 @@ int tc90522_read_multiple_regs(struct tc90522_demod *demod, struct tc90522_regbu
 	if (!regbuf || !num)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
+#endif
 
 	for (i = 0; i < num; i++) {
 		ret = _tc90522_read_regs(demod, regbuf[i].reg, regbuf[i].buf, regbuf[i].u.len);
@@ -108,7 +127,11 @@ int tc90522_read_multiple_regs(struct tc90522_demod *demod, struct tc90522_regbu
 			break;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return ret;
 }
@@ -152,11 +175,19 @@ int tc90522_write_regs(struct tc90522_demod *demod, u8 reg, u8 *buf, u8 len)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
+#endif
 
 	ret = _tc90522_write_regs(demod, reg, buf, len);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return ret;
 }
@@ -165,11 +196,19 @@ int tc90522_write_reg(struct tc90522_demod *demod, u8 reg, u8 val)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
+#endif
 
 	ret = _tc90522_write_regs(demod, reg, &val, 1);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return ret;
 }
@@ -181,7 +220,11 @@ int tc90522_write_multiple_regs(struct tc90522_demod *demod, struct tc90522_regb
 	if (!regbuf || !num)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
+#endif
 
 	for (i = 0; i < num; i++) {
 		if (regbuf[i].buf)
@@ -193,7 +236,11 @@ int tc90522_write_multiple_regs(struct tc90522_demod *demod, struct tc90522_regb
 			break;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return ret;
 }
@@ -204,7 +251,11 @@ static int tc90522_i2c_master_request(void *i2c_priv, struct i2c_comm_request *r
 	struct tc90522_demod *demod = i2c_priv;
 	struct i2c_comm_request *master_req = NULL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
+#endif
 
 	for (i = 0; i < num; i++) {
 		switch (req[i].req) {
@@ -345,14 +396,22 @@ exit_with_free:
 		kfree(master_req);
 
 exit:
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return ret;
 }
 
 int tc90522_init(struct tc90522_demod *demod)
 {
+#if defined(__FreeBSD__)
+        sx_init(&demod->priv.xlock, "tc90522");
+#else
 	mutex_init(&demod->priv.lock);
+#endif
 
 	demod->i2c_master.request = tc90522_i2c_master_request;
 	demod->i2c_master.priv = demod;
@@ -365,7 +424,11 @@ int tc90522_term(struct tc90522_demod *demod)
 	demod->i2c_master.request = NULL;
 	demod->i2c_master.priv = NULL;
 
+#if defined(__FreeBSD__)
+	sx_destroy(&demod->priv.xlock);
+#else
 	mutex_destroy(&demod->priv.lock);
+#endif
 
 	return 0;
 }
@@ -539,7 +602,11 @@ int tc90522_is_signal_locked_t(struct tc90522_demod *demod, bool *lock)
 
 	*lock = false;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&demod->priv.xlock);
+#else
 	mutex_lock(&demod->priv.lock);
+#endif
 
 	ret = _tc90522_read_reg(demod, 0x80, &b);
 	if (ret || (b & 0x28))
@@ -552,7 +619,11 @@ int tc90522_is_signal_locked_t(struct tc90522_demod *demod, bool *lock)
 	*lock = true;
 
 exit:
+#if defined(__FreeBSD__)
+	sx_xunlock(&demod->priv.xlock);
+#else
 	mutex_unlock(&demod->priv.lock);
+#endif
 
 	return 0;
 }

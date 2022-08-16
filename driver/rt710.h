@@ -64,7 +64,7 @@ struct rt710_config {
 
 struct rt710_priv {
 #if defined(__FreeBSD__)
-  struct mtx lock;
+	struct sx xlock;
 #else
 	struct mutex lock;
 #endif
@@ -74,7 +74,11 @@ struct rt710_priv {
 };
 
 struct rt710_tuner {
+#if defined(__FreeBSD__)
+	device_t dev;
+#else
 	struct device *dev;
+#endif
 	struct i2c_comm_master *i2c;
 	u8 i2c_addr;
 	struct rt710_config config;

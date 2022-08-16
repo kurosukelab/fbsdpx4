@@ -8,7 +8,7 @@
 #if defined(__FreeBSD__)
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/mutex.h>
+#include <sys/sx.h>
 #include <sys/condvar.h>
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -315,7 +315,11 @@ int rt710_init(struct rt710_tuner *t)
 	int ret = 0;
 	u8 tmp;
 
+#if defined(__FreeBSD__)
+	sx_init(&t->priv.xlock, "rt710");
+#else
 	mutex_init(&t->priv.lock);
+#endif
 
 	t->priv.init = false;
 	t->priv.freq = 0;
@@ -338,7 +342,11 @@ int rt710_term(struct rt710_tuner *t)
 	if (!t->priv.init)
 		return 0;
 
+#if defined(__FreeBSD__)
+	sx_destroy(&t->priv.xlock);
+#else
 	mutex_destroy(&t->priv.lock);
+#endif
 
 	t->priv.init = false;
 
@@ -355,7 +363,11 @@ int rt710_sleep(struct rt710_tuner *t)
 
 	memcpy(regs, sleep_regs, sizeof(regs));
 
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	if (t->priv.chip == RT710_CHIP_TYPE_RT720) {
 		regs[0x01] = 0x5e;
@@ -365,7 +377,11 @@ int rt710_sleep(struct rt710_tuner *t)
 
 	ret = _rt710_write_regs(t, 0x00, regs, NUM_REGS);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	return ret;
 }
@@ -442,7 +458,11 @@ int rt710_set_params(struct rt710_tuner *t, u32 freq, u32 symbol_rate, u32 rollo
 		regs[0x03] &= 0xf0;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	ret = _rt710_write_regs(t, 0x00, regs, NUM_REGS);
 	if (ret) {
@@ -587,12 +607,20 @@ int rt710_set_params(struct rt710_tuner *t, u32 freq, u32 symbol_rate, u32 rollo
 	if (ret)
 		goto fail;
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	return 0;
 
 fail:
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	return ret;
 }
@@ -605,11 +633,19 @@ int rt710_is_pll_locked(struct rt710_tuner *t, bool *locked)
 	if (!t->priv.init)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	ret = _rt710_read_regs(t, 0x02, &tmp, 1);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	if (ret) {
 		dev_err(t->dev, "rt710_is_pll_locked: _rt710_read_regs() failed. (ret: %d)\n", ret);
@@ -629,11 +665,19 @@ int rt710_get_rf_gain(struct rt710_tuner *t, u8 *gain)
 	if (!t->priv.init)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	ret = _rt710_read_regs(t, 0x01, &tmp, 1);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	if (ret) {
 		dev_err(t->dev, "rt710_get_rf_gain: _rt710_read_regs() failed. (ret: %d)\n", ret);

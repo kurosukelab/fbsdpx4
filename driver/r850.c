@@ -9,7 +9,7 @@
 #if defined(__FreeBSD__)
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/mutex.h>
+#include <sys/sx.h>
 #include <sys/condvar.h>
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -2005,7 +2005,11 @@ int r850_init(struct r850_tuner *t)
 	int ret = 0, i;
 	u8 regs[R850_NUM_REGS];
 
+#if defined(__FreeBSD__)
+	sx_init(&t->priv.xlock, "r850");
+#else
 	mutex_init(&t->priv.lock);
+#endif
 
 	t->priv.init = false;
 
@@ -2074,7 +2078,11 @@ int r850_term(struct r850_tuner *t)
 
 	t->priv.chip = 0;
 
+#if defined(__FreeBSD__)
+	sx_destroy(&t->priv.xlock);
+#else
 	mutex_destroy(&t->priv.lock);
+#endif
 
 	t->priv.init = false;
 
@@ -2089,7 +2097,11 @@ int r850_sleep(struct r850_tuner *t)
 		return -EINVAL;
 
 #if 0
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	if (t->priv.sleep)
 		goto exit;
@@ -2141,7 +2153,11 @@ int r850_sleep(struct r850_tuner *t)
 	t->priv.sys_curr.system = R850_SYSTEM_UNDEFINED;
 
 exit:
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 #endif
 
 	return ret;
@@ -2155,7 +2171,11 @@ int r850_wakeup(struct r850_tuner *t)
 		return -EINVAL;
 
 #if 0
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	if (!t->priv.sleep)
 		goto exit;
@@ -2180,7 +2200,12 @@ int r850_wakeup(struct r850_tuner *t)
 		t->priv.sleep = false;
 
 exit:
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
+	
 #endif
 
 	return ret;
@@ -2219,7 +2244,11 @@ int r850_set_system(struct r850_tuner *t, struct r850_system_config *system)
 		return -EINVAL;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	t->priv.sys = *system;
 	t->priv.mixer_mode = mixer_mode;
@@ -2227,7 +2256,11 @@ int r850_set_system(struct r850_tuner *t, struct r850_system_config *system)
 
 	t->priv.sys_curr.system = R850_SYSTEM_UNDEFINED;
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	return 0;
 }
@@ -2242,7 +2275,11 @@ int r850_set_frequency(struct r850_tuner *t, u32 freq)
 	if (freq < 40000 || freq > 1002000)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	ret = _r850_set_system_params(t);
 	if (ret)
@@ -2251,7 +2288,11 @@ int r850_set_frequency(struct r850_tuner *t, u32 freq)
 	ret = _r850_set_system_frequency(t, freq);
 
 exit:
+#if defined(__FreeBSD__)
+	sx_unlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	return ret;
 }
@@ -2264,11 +2305,19 @@ int r850_is_pll_locked(struct r850_tuner *t, bool *locked)
 	if (!t->priv.init)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&t->priv.xlock);
+#else
 	mutex_lock(&t->priv.lock);
+#endif
 
 	ret = _r850_read_regs(t, 0x02, &tmp, 1);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&t->priv.xlock);
+#else
 	mutex_unlock(&t->priv.lock);
+#endif
 
 	if (ret) {
 		dev_err(t->dev, "r850_is_pll_locked: r850_read_regs() failed. (ret: %d)\n", ret);

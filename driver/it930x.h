@@ -61,7 +61,7 @@ struct it930x_gpio_state {
 struct it930x_priv {
 	struct it930x_i2c_master_info i2c[3];
 #if defined(__FreeBSD__)
-	struct mtx lock;
+	struct sx xlock;
 #else
 	struct mutex lock;
 #endif
@@ -71,7 +71,11 @@ struct it930x_priv {
 };
 
 struct it930x_bridge {
+#if defined(__FreeBSD__)
+	device_t dev;
+#else
 	struct device *dev;
+#endif
 	struct it930x_bus bus;
 	struct it930x_config config;
 	struct i2c_comm_master i2c_master[3];

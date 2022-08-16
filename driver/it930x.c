@@ -8,7 +8,8 @@
 #if defined(__FreeBSD__)
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/mutex.h>
+//#include <sys/mutex.h>
+#include <sys/sx.h>
 #include <sys/condvar.h>
 #include <sys/errno.h>
 #include <sys/firmware.h>
@@ -186,12 +187,19 @@ int it930x_read_regs(struct it930x_bridge *it930x, u32 reg, u8 *buf, u8 len)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
-
+#endif
 	ret = _it930x_read_regs(it930x, reg, buf, len);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
-
+#endif
+	
 	return ret;
 }
 
@@ -199,11 +207,19 @@ int it930x_read_reg(struct it930x_bridge *it930x, u32 reg, u8 *val)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
-
+#endif
+	
 	ret = _it930x_read_regs(it930x, reg, val, 1);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 	
 	return ret;
 }
@@ -217,7 +233,11 @@ int it930x_read_multiple_regs(struct it930x_bridge *it930x, struct it930x_regbuf
 		return -EINVAL;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
+#endif
 
 	for (i = 0; i < num; i++) {
 		ret = _it930x_read_regs(it930x, regbuf[i].reg, regbuf[i].buf, regbuf[i].u.len);
@@ -225,7 +245,11 @@ int it930x_read_multiple_regs(struct it930x_bridge *it930x, struct it930x_regbuf
 			break;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return ret;
 }
@@ -269,11 +293,19 @@ int it930x_write_regs(struct it930x_bridge *it930x, u32 reg, u8 *buf, u8 len)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
-
+#endif
+	
 	ret = _it930x_write_regs(it930x, reg, buf, len);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return ret;
 }
@@ -282,11 +314,19 @@ int it930x_write_reg(struct it930x_bridge *it930x, u32 reg, u8 val)
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
-
+#endif
+	
 	ret = _it930x_write_regs(it930x, reg, &val, 1);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return ret;
 }
@@ -300,7 +340,11 @@ int it930x_write_multiple_regs(struct it930x_bridge *it930x, struct it930x_regbu
 		return -EINVAL;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
+#endif
 
 	for (i = 0; i < num; i++) {
 		if (regbuf[i].buf)
@@ -312,7 +356,11 @@ int it930x_write_multiple_regs(struct it930x_bridge *it930x, struct it930x_regbu
 			break;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return ret;
 }
@@ -350,11 +398,19 @@ int it930x_write_reg_bits(struct it930x_bridge *it930x, u32 reg, u8 val, u8 pos,
 {
 	int ret = 0;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
+#endif
 
 	ret = _it930x_write_reg_bits(it930x, reg, val, pos, len);
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return ret;
 }
@@ -365,7 +421,11 @@ static int it930x_i2c_master_request(void *i2c_priv, struct i2c_comm_request *re
 	struct it930x_i2c_master_info *i2c = i2c_priv;
 	struct it930x_priv *priv = &i2c->it930x->priv;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&priv->xlock);
+#else
 	mutex_lock(&priv->lock);
+#endif
 
 	for (i = 0; i < num; i++) {
 		u16 addr;
@@ -455,8 +515,12 @@ static int it930x_i2c_master_request(void *i2c_priv, struct i2c_comm_request *re
 			break;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xunlock(&priv->xlock);
+#else
 	mutex_unlock(&priv->lock);
-
+#endif
+	
 	return ret;
 }
 
@@ -708,7 +772,11 @@ int it930x_init(struct it930x_bridge *it930x)
 	if (!buf)
 		return -ENOMEM;
 
+#if defined(__FreeBSD__)
+	sx_init(&it930x->priv.xlock, "it930x->priv.xlock");
+#else
 	mutex_init(&it930x->priv.lock);
+#endif
 
 	// set i2c operator
 
@@ -744,8 +812,12 @@ int it930x_term(struct it930x_bridge *it930x)
 		it930x->i2c_master[i].priv = NULL;
 	}
 
+#if defined(__FreeBSD__)
+	sx_destroy(&it930x->priv.xlock);
+#else
 	mutex_destroy(&it930x->priv.lock);
-
+#endif
+	
 	return 0;
 }
 
@@ -760,7 +832,11 @@ int it930x_load_firmware(struct it930x_bridge *it930x, const char *filename)
 	if (!filename)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
+#endif
 
 	ret = _it930x_get_firmware_version(it930x, &fw_version);
 	if (ret) {
@@ -868,7 +944,11 @@ exit_fw:
 #endif
 	
 exit:
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return ret;
 }
@@ -882,7 +962,11 @@ int it930x_init_device(struct it930x_bridge *it930x)
 		return -EINVAL;
 	}
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
+#endif
 
 	ret = _it930x_write_reg(it930x, 0x4976, 0);
 	if (ret)
@@ -948,7 +1032,11 @@ int it930x_init_device(struct it930x_bridge *it930x)
 	}
 
 exit:
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return 0;
 }
@@ -1125,7 +1213,11 @@ int it930x_purge_psb(struct it930x_bridge *it930x, int timeout)
 	if (it930x->bus.type != IT930X_BUS_USB)
 		return -EINVAL;
 
+#if defined(__FreeBSD__)
+	sx_xlock(&it930x->priv.xlock);
+#else
 	mutex_lock(&it930x->priv.lock);
+#endif
 
 	ret = _it930x_write_reg_bits(it930x, 0xda1d, 1, 0, 1);
 	if (ret)
@@ -1153,7 +1245,11 @@ int it930x_purge_psb(struct it930x_bridge *it930x, int timeout)
 		ret = 0;
 
 exit:
+#if defined(__FreeBSD__)
+	sx_xunlock(&it930x->priv.xlock);
+#else
 	mutex_unlock(&it930x->priv.lock);
+#endif
 
 	return ret;
 }

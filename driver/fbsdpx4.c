@@ -1552,8 +1552,9 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 			dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: it930x_bus_start_streaming() failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
 			goto fail_after_ringbuffer;
 		}
+		mtx_lock( &bus->usb.stream_mtx );
 		usbd_transfer_start( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
-
+		mtx_unlock( &bus->usb.stream_mtx );
 	}
 
 	px4->streaming_count++;
@@ -1604,8 +1605,9 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 		dev_dbg(px4->dev, "px4_tsdev_stop_streaming %d:%u: stopping...\n", px4->dev_idx, tsdev->id);
 		it930x_bus_stop_streaming(&px4->it930x.bus);
 
+		mtx_lock( &bus->usb.stream_mtx );
 		usbd_transfer_stop( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
-		
+		mtx_unlock( &bus->usb.stream_mtx );
 	}
 	streaming_count = px4->streaming_count;
 

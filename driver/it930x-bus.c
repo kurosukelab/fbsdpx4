@@ -302,14 +302,12 @@ static int it930x_usb_ctrl_tx_msg(struct it930x_bus *bus, const void *buf, int l
 	}
 	bus->usb.event = 0;
 	
-	mtx_unlock( &bus->usb.xfer_mtx );
-
 	ret= xfer->error;
 	if(ret){
 		dev_err( bus->dev, "%s:tx error=%d\n", __FUNCTION__, ret);
 		usbd_transfer_stop( xfer );
 	}
-
+	mtx_unlock( &bus->usb.xfer_mtx );
 
 	return ret;
 }
@@ -337,8 +335,6 @@ static int it930x_usb_ctrl_rx_msg(struct it930x_bus *bus, void *buf, int len, in
 	}
 	bus->usb.event = 0;
 
-	mtx_unlock( &bus->usb.xfer_mtx );
-	
 	ret= xfer->error;
 	if( !ret ){
 		pc = usbd_xfer_get_frame( xfer, 0 );
@@ -355,7 +351,7 @@ static int it930x_usb_ctrl_rx_msg(struct it930x_bus *bus, void *buf, int len, in
 	else {
 		usbd_transfer_stop( xfer );
 	}
-
+	mtx_unlock( &bus->usb.xfer_mtx );
 	
 	return ret;
 }
