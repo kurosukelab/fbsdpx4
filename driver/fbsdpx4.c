@@ -7,6 +7,9 @@
 #include <sys/kernel.h>
 #include <sys/bus.h>
 #include <sys/module.h>
+#include <sys/kthread.h>
+#include <sys/proc.h>
+#include <sys/sched.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/condvar.h>
@@ -68,6 +71,9 @@
 #define FIFO_NO_SPACE_PROHIBIT (500)
 
 //#define CONTINUITY_COUNTER_CHECK
+#define STREAM_THREAD
+#define STREAM_SIZE     (188 * 1024)
+#define MAX_STREAM_ELEMENT  ( 12 )
 
 struct px4_tsdev {
 	struct sx xlock;
@@ -99,13 +105,30 @@ struct px4_tsdev {
 	char continuity_counter[0x2000];
 #endif
 };
+#ifdef STREAM_THREAD
+struct stream {
+	TAILQ_ENTRY( stream ) entry;
+	uint32_t len;
+	uint8_t  data[ STREAM_SIZE ];
+};
 
+TAILQ_HEAD( stream_head, stream );
+#endif
+	
 struct px4_stream_context {
 	struct px4_tsdev *ptsdev[ TSDEV_NUM ];
 	u8 remain_buf[ 2*TS_SYNC_SIZE ];
 	size_t remain_len;
 	u8 sync_flag;
 	u8 resync_count;
+#ifdef STREAM_THREAD
+	struct mtx mtx;
+	struct cv cv;
+	int event;
+	struct stream_head stream_list;
+	struct stream_head stream_freelist;
+	struct stream stream_element[ MAX_STREAM_ELEMENT ];
+#endif
 	
 };
 
@@ -132,6 +155,9 @@ struct px4_softc {
 	unsigned int streaming_count;
 	struct px4_tsdev tsdev[TSDEV_NUM];
 	struct usb_fifo_sc sc_fifo[ TSDEV_NUM ];
+#ifdef STREAM_THREAD
+	struct proc *kthread;
+#endif
 	struct px4_stream_context *stream_context;
 	struct cdev cdev;
 };
@@ -167,8 +193,8 @@ static bool disable_multi_device_power_control = true;
 bool s_tuner_no_sleep = false;
 //unsigned int px4_debug = 4;
 unsigned int px4_debug = 7;
-static unsigned int discard_ts_packets = 1024;
-//static unsigned int discard_ts_packets = 0;
+//static unsigned int discard_ts_packets = 1024;
+static unsigned int discard_ts_packets = 0;
 
 
 static struct usb_fifo_methods px4_fifo_methods = {
@@ -181,6 +207,9 @@ static struct usb_fifo_methods px4_fifo_methods = {
 	.postfix[0] = "s"
 };
 
+#ifdef STREAM_THREAD
+static void stream_thread( void *arg );
+#endif
 static int px4_sysctl_debug(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_tsdev_max_packets(SYSCTL_HANDLER_ARGS);
 static int px4_sysctl_xfer_packets(SYSCTL_HANDLER_ARGS);
@@ -326,13 +355,44 @@ static int px4_init(struct px4_softc *px4)
 		tsdev->sc_fifo_open= NULL;
 		px4->stream_context->ptsdev[ i ] = tsdev;
 	}
+#ifdef STREAM_THREAD
+	{
+		struct proc *p;
+		mtx_init(&px4->stream_context->mtx, "stream_context", NULL, MTX_DEF );
+		cv_init(&px4->stream_context->cv, "stream_context");
+		px4->stream_context->event = 0;
+		
+		TAILQ_INIT( &px4->stream_context->stream_list );
+		TAILQ_INIT( &px4->stream_context->stream_freelist );
+		for(i=0; i < MAX_STREAM_ELEMENT; i++){
+			TAILQ_INSERT_TAIL( &px4->stream_context->stream_freelist,
+							   &px4->stream_context->stream_element[ i ],
+							   entry );
 
+		}
+		ret = kproc_create( &stream_thread, px4->stream_context, &p, RFHIGHPID, 0, "stream_thread");
+		
+		if( !ret ){
+			px4->kthread = p;
+		}
+	}
+#endif
+	
 	return ret;
 }
 
 static int px4_term(struct px4_softc *px4)
 {
-
+#ifdef STREAM_THREAD
+	mtx_lock( &px4->stream_context->mtx );
+	px4->stream_context->event = -1;
+	cv_signal( &px4->stream_context->cv );
+	mtx_sleep( px4->kthread, &px4->stream_context->mtx, PWAIT, "stream", 0 );
+	mtx_unlock( &px4->stream_context->mtx );
+	mtx_destroy( &px4->stream_context->mtx );
+	cv_destroy( &px4->stream_context->cv );
+#endif
+	
 	cv_destroy( &px4->wait_cv );
 	mtx_destroy( &px4->wait_mtx );
 	sx_destroy( &px4->xlock);
@@ -574,6 +634,7 @@ exit:
 	return ret;
 }
 
+#if 0
 static bool px4_ts_sync(u8 **buf, u32 *len, bool *sync_remain)
 {
 	bool ret = false;
@@ -948,7 +1009,7 @@ static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, struct usb_p
 		remain -= 188;
 		*offset += 188;
 		
-		if( page_len < 0 ){
+		if( page_len <= 0 ){
 			usbd_get_page(pc, *offset, &res);
 			p= res.buffer;
 			page_len= res.length;
@@ -962,7 +1023,471 @@ static void px4_ts_write_with_page_cache(struct px4_tsdev **ptsdev, struct usb_p
 
 	return;
 }
+#else
+static void px4_stream_process(struct px4_tsdev **ptsdev, u8 **buf, u32 *len )
+{
+#ifdef CONTINUITY_COUNTER_CHECK
+	struct px4_softc *px4= container_of( ptsdev[0] , struct px4_softc, tsdev[0]);
+#endif
+	
+	u8 *p = *buf;
+	u32 remain = *len;
+	struct px4_tsdev *tsdev;
+	
+	while ( remain ) {
+		u32 i;
+		bool sync_remain = false;
 
+		for( i = 0; i < TS_SYNC_COUNT; i++ ){
+			if (((i + 1) * 188) <= remain) {
+				if ((p[i * 188] & 0x8f) != 0x07)
+					break;
+			} else {
+				sync_remain = true;
+				break;
+			}
+		}
+		
+		if( sync_remain )
+			break;
+		
+		if (i < TS_SYNC_COUNT) {
+			p += 1;
+			remain -= 1;
+			continue;
+		}
+		
+		while (remain >= 188 && ((p[0] & 0x8f) == 0x07)) {
+			u8 id = (p[0] & 0x70) >> 4;
+
+			if (id && id < 5) {
+				p[0] = 0x47;
+				tsdev= ptsdev[ id - 1 ];
+				
+				if( atomic_read( &tsdev->ts_packet_read ) ){
+					//if( usb_fifo_put_bytes_max( tsdev->sc_fifo_open ) ){
+					{
+						u32 index = tsdev->stream_index;
+						u32 max_buf_size = tsdev->stream_buffer_size;
+						u32 prev_pending_size =tsdev->pending_stream_size;
+						u32 pending_size = prev_pending_size + 188;
+						u8 *streambuf = &tsdev->stream_buffers[ max_buf_size * index ];
+						
+#if 0
+						tsdev->discard_ts_packets -= ( tsdev->discard_ts_packets > 0 );
+						tsdev->ts_packet_count++;
+						
+						if( !tsdev->discard_ts_packets ){
+#ifdef CONTINUITY_COUNTER_CHECK
+							u32 pid;
+							u32 adaptation_field_control;
+							u32 current;
+							
+							pid  = p[1] << 8;
+							pid += p[2];
+							pid &= 0x1FFF;
+							
+							adaptation_field_control = (p[3] & 0x30)>>4;
+							current = p[3] & 0xF;
+							if( pid != 0x1FFF ){
+								if( tsdev->continuity_counter[pid] >= 0 ){
+									if( ( adaptation_field_control & 1 ) == 0 ){
+										if( current != tsdev->continuity_counter[pid] ){
+											dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu, adap=0 pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x\n",
+													 __FUNCTION__,
+													 id-1,
+													 tsdev->ts_packet_count,
+													 pid,
+													 tsdev->continuity_counter[pid],
+													 p[0],p[1],p[2],p[3]);
+										}
+									}
+									else {
+										if( current != ((tsdev->continuity_counter[pid]+1)&0xF) ){
+											dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu,pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x\n",
+													 __FUNCTION__,
+													 id-1,
+													 tsdev->ts_packet_count,
+													 pid,
+													 tsdev->continuity_counter[pid],
+													 p[0],p[1],p[2],p[3]);
+										}
+									}
+								}
+								tsdev->continuity_counter[pid] = current;
+							}
+#endif
+							memcpy( streambuf + prev_pending_size, p, 188);
+							
+							if( pending_size < max_buf_size ){
+								tsdev->pending_stream_size = pending_size;
+							}
+							else {
+								usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+														  streambuf,
+														  max_buf_size );
+								
+								index++;
+								index *= ( index < tsdev->stream_max_index );
+								
+								tsdev->stream_index = index;
+								tsdev->pending_stream_size = 0;
+							}
+						}
+#else
+						memcpy( streambuf + prev_pending_size, p, 188);
+						
+						if( pending_size < max_buf_size ){
+							tsdev->pending_stream_size = pending_size;
+						}
+						else {
+							usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+													  streambuf,
+													  max_buf_size );
+							
+							index++;
+							index *= ( index < tsdev->stream_max_index );
+							
+							tsdev->stream_index = index;
+							tsdev->pending_stream_size = 0;
+						}
+#endif
+					}
+				}
+			}
+			p += 188;
+			remain -= 188;
+		}
+	}
+
+	*buf = p;
+	*len = remain;
+
+	return;
+}
+
+#ifndef STREAM_THREAD
+static void px4_stream_process_with_page_cache(struct px4_tsdev **ptsdev, struct usb_page_cache *pc, usb_frlength_t *offset, u32 *len)
+{
+#ifdef CONTINUITY_COUNTER_CHECK
+	struct px4_softc *px4= container_of( ptsdev[0] , struct px4_softc, tsdev[0]);
+#endif
+
+	u8 *p;
+	u32 remain = *len;
+	struct px4_tsdev *tsdev;
+	struct usb_page_search res;
+	u8 *tmp_ptr;
+	s32 page_len;
+	s32 tmp_page_len;
+	s32 pos;
+
+	usbd_get_page(pc, *offset, &res);
+	p= res.buffer;
+	page_len= res.length;
+	
+	tmp_ptr = p;
+	tmp_page_len = page_len;
+	pos = -188;
+	
+	while (remain) {
+		u32 i;
+		bool sync_remain = false;
+		
+		for (i = 0; i < TS_SYNC_COUNT; i++) {
+			if (((i + 1) * 188) <= remain) {
+				if( 188 <= tmp_page_len ){
+					tmp_page_len -= 188;
+					pos += 188;
+				}
+				else {
+					usbd_get_page(pc, *offset + i*188 , &res);
+					tmp_ptr= res.buffer;
+					tmp_page_len = res.length;
+					pos = 0;
+				}
+				
+				if ((tmp_ptr[pos] & 0x8f) != 0x07)
+					break;
+			} else {
+				sync_remain = true;
+				break;
+			}
+		}
+		
+		if( sync_remain )
+			break;
+		
+		if (i < TS_SYNC_COUNT) {
+			page_len -= 1;
+			remain -= 1;
+			*offset += 1;
+			
+			if( page_len <= 0 ){
+				usbd_get_page(pc, *offset, &res);
+				p= res.buffer;
+				page_len= res.length;
+				
+				tmp_ptr = p;
+				tmp_page_len = page_len;
+			}
+			else {
+				p += 1;
+				
+				tmp_ptr = p;
+				tmp_page_len = page_len;
+			}
+			pos = -188;
+			
+			continue;
+		}
+		
+		while (remain >= 188 && ((p[0] & 0x8f) == 0x07)) {
+			u8 id = (p[0] & 0x70) >> 4;
+			
+			if (id && id < 5) {
+				p[0] = 0x47;
+				tsdev= ptsdev[ id - 1 ];
+				
+				if( atomic_read( &tsdev->ts_packet_read ) ){
+					//if( usb_fifo_put_bytes_max( tsdev->sc_fifo_open ) ){
+					{
+						u32 index = tsdev->stream_index;
+						u32 max_buf_size = tsdev->stream_buffer_size;
+						u32 prev_pending_size =tsdev->pending_stream_size;
+						u32 pending_size = prev_pending_size + 188;
+						u8 *streambuf = &tsdev->stream_buffers[ max_buf_size * index ];
+						
+#if 0
+						tsdev->discard_ts_packets -= ( tsdev->discard_ts_packets > 0 );
+						tsdev->ts_packet_count++;
+						
+						if( !tsdev->discard_ts_packets ){
+#ifdef CONTINUITY_COUNTER_CHECK
+							u32 pid;
+							u32 adaptation_field_control;
+							u32 current;
+							
+							pid  = p[1] << 8;
+							pid += p[2];
+							pid &= 0x1FFF;
+							
+							adaptation_field_control = (p[3] & 0x30)>>4;
+							current = p[3] & 0xF;
+							if( pid != 0x1FFF ){
+								if( tsdev->continuity_counter[pid] >= 0 ){
+									if( ( adaptation_field_control & 1 ) == 0 ){
+										if( current != tsdev->continuity_counter[pid] ){
+											dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu,adap=0 pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x pc_offset=%d\n",
+													 __FUNCTION__,
+													 id-1,
+													 tsdev->ts_packet_count,
+													 pid,
+													 tsdev->continuity_counter[pid],
+													 p[0],p[1],p[2],p[3],
+													 *offset);
+										}
+									}
+									else {
+										if( current != ((tsdev->continuity_counter[pid]+1)&0xF) ){
+											dev_dbg( px4->dev, "%s:fifo[%d] ts_packet_count=%lu, pid=%x continuity_counter=%d ng header=%02x%02x%02x%02x pc_offset=%d\n",
+													 __FUNCTION__,
+													 id-1,
+													 tsdev->ts_packet_count,
+													 pid,
+													 tsdev->continuity_counter[pid],
+													 p[0],p[1],p[2],p[3],
+													 *offset);
+										}
+									}
+								}
+								tsdev->continuity_counter[pid] = current;
+							}
+#endif
+							
+							usbd_copy_out( pc, *offset, streambuf + prev_pending_size, 188 );
+							
+							if( pending_size < max_buf_size ){
+								tsdev->pending_stream_size = pending_size;
+							}
+							else {
+								usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+														  streambuf,
+														  max_buf_size );
+								
+								index++;
+								index *= ( index < tsdev->stream_max_index );
+								tsdev->stream_index = index;
+								tsdev->pending_stream_size = 0;
+							}
+						}
+#else
+						usbd_copy_out( pc, *offset, streambuf + prev_pending_size, 188 );
+						
+						if( pending_size < max_buf_size ){
+							tsdev->pending_stream_size = pending_size;
+						}
+						else {
+							usb_fifo_put_data_buffer( tsdev->sc_fifo_open,
+													  streambuf,
+													  max_buf_size );
+							
+							index++;
+							index *= ( index < tsdev->stream_max_index );
+							tsdev->stream_index = index;
+							tsdev->pending_stream_size = 0;
+						}
+#endif
+					}
+				}
+			}
+			
+			page_len -= 188;
+			remain -= 188;
+			*offset += 188;
+			
+			if( page_len <= 0 ){
+				usbd_get_page(pc, *offset, &res);
+				p= res.buffer;
+				page_len= res.length;
+			}
+			else {
+				p += 188;
+			}
+		}
+		tmp_ptr = p;
+		tmp_page_len = page_len;
+		pos = -188;
+	}
+
+	*len = remain;
+
+	return;
+}
+#endif
+#endif
+
+#ifdef STREAM_THREAD
+static void stream_thread( void *arg )
+{
+	struct px4_stream_context *stream_context = arg;
+	pr_debug("stream_thread:start\n");
+	
+	for(;;){
+		int ev;
+		struct stream *pdata;
+		
+		mtx_lock(&stream_context->mtx);
+		while( (ev = stream_context->event ) == 0 ){
+			//pr_debug("stream_thread:call cv_wait\n");
+			cv_wait( &stream_context->cv, &stream_context->mtx);
+		}
+		stream_context->event = 0;
+		mtx_unlock(&stream_context->mtx);
+
+		if( ev == -1 ){
+			break;
+		}
+		else {
+			mtx_lock(&stream_context->mtx);
+			while( ( pdata = TAILQ_FIRST( &stream_context->stream_list ) ) != NULL ){
+				TAILQ_REMOVE( &stream_context->stream_list, pdata, entry );
+				mtx_unlock(&stream_context->mtx);
+				{
+					u8 *context_remain_buf = stream_context->remain_buf;
+					u32 context_remain_len = stream_context->remain_len;
+					u32 len = pdata->len;
+					u32 remain = pdata->len;
+					u32 offset = 0;
+					u8 *p;
+					
+					if (context_remain_len) {
+						if ((context_remain_len + len) >= TS_SYNC_SIZE) {
+							u32 write_size;
+							
+							write_size = TS_SYNC_SIZE - context_remain_len;
+							
+							memcpy( context_remain_buf + context_remain_len,
+									pdata->data,
+									write_size );
+							context_remain_len = TS_SYNC_SIZE;
+							
+							px4_stream_process( stream_context->ptsdev, &context_remain_buf, &context_remain_len );
+							
+							if( !context_remain_len ){
+								offset += write_size;
+								remain -= write_size;
+							}
+							
+							stream_context->remain_len = 0;
+						} else {
+							memcpy( context_remain_buf + context_remain_len,
+									pdata->data,
+									len );
+							stream_context->remain_len += len;
+							
+							mtx_lock(&stream_context->mtx);
+							TAILQ_INSERT_TAIL( &stream_context->stream_freelist, pdata, entry );
+							continue;
+						}
+					}
+					p = &pdata->data[ offset ];
+					
+					px4_stream_process( stream_context->ptsdev, &p, &remain );
+					
+					if (remain) {
+						//pr_debug("save remain. remain=%u\n", remain);
+						memcpy( stream_context->remain_buf, p, remain );
+						stream_context->remain_len = remain;
+					}
+					
+					mtx_lock(&stream_context->mtx);
+					TAILQ_INSERT_TAIL( &stream_context->stream_freelist, pdata, entry );
+				}
+			}
+			mtx_unlock(&stream_context->mtx);
+		}
+	}
+	kproc_exit(0);
+	
+	return;
+}
+
+static int px4_stream_handler(void *context, struct usb_page_cache *pc, u32 len)
+{
+	struct px4_stream_context *stream_context = context;
+	struct stream *pdata;
+	u32 remain = len;
+	u32 write_size;
+	
+	mtx_lock(&stream_context->mtx);
+	while( remain ){
+		pdata = TAILQ_FIRST( &stream_context->stream_freelist );
+		if( pdata ){
+			TAILQ_REMOVE( &stream_context->stream_freelist, pdata, entry );
+			mtx_unlock(&stream_context->mtx);
+			
+			write_size = min( remain, STREAM_SIZE );
+			
+			usbd_copy_out( pc, 0, pdata->data, write_size );
+			pdata->len = write_size;
+			remain -= write_size;
+			
+			mtx_lock(&stream_context->mtx);
+			TAILQ_INSERT_TAIL( &stream_context->stream_list, pdata, entry );
+			stream_context->event = 1;
+			cv_signal( &stream_context->cv );
+			//pr_debug("px4_stream_handler:send signal\n");
+		}
+		else {
+			pr_debug("px4_stream_handler: stream_freelist is empty!! remain=%u\n", remain);
+		}
+	}
+	mtx_unlock(&stream_context->mtx);
+	
+	return 0;
+}
+#else
 static int px4_stream_handler(void *context, struct usb_page_cache *pc, u32 len)
 {
 	struct px4_stream_context *stream_context = context;
@@ -970,8 +1495,10 @@ static int px4_stream_handler(void *context, struct usb_page_cache *pc, u32 len)
 	u32 context_remain_len = stream_context->remain_len;
 	u32 remain = len;
 	usb_frlength_t offset=0;
-	bool sync_remain = false;
 
+#if 0
+	bool sync_remain = false;
+	
 	if (context_remain_len) {
 		if ((context_remain_len + len) >= TS_SYNC_SIZE) {
 			u32 l;
@@ -1052,9 +1579,42 @@ static int px4_stream_handler(void *context, struct usb_page_cache *pc, u32 len)
 		usbd_copy_out( pc, offset, stream_context->remain_buf, remain );
 		stream_context->remain_len = remain;
 	}
+#else
+	if (context_remain_len) {
+		if ((context_remain_len + len) >= TS_SYNC_SIZE) {
+			u32 write_size;
 
+			write_size = TS_SYNC_SIZE - context_remain_len;
+			
+			usbd_copy_out( pc, offset, context_remain_buf + context_remain_len, write_size );
+			context_remain_len = TS_SYNC_SIZE;
+
+			px4_stream_process( stream_context->ptsdev, &context_remain_buf, &context_remain_len );
+			
+			if( !context_remain_len ){
+				offset += write_size;
+				remain -= write_size;
+			}
+
+			stream_context->remain_len = 0;
+		} else {
+			usbd_copy_out( pc, offset, context_remain_buf + context_remain_len, len );
+			stream_context->remain_len += len;
+
+			return 0;
+		}
+	}
+
+	px4_stream_process_with_page_cache( stream_context->ptsdev, pc, &offset, &remain ); 
+	
+	if(remain) {
+		usbd_copy_out( pc, offset, stream_context->remain_buf, remain );
+		stream_context->remain_len = remain;
+	}
+#endif
 	return 0;
 }
+#endif
 
 static struct tc90522_regbuf tc_init_s[] = {
 	{ 0x15, NULL, { 0x00 } },
@@ -1502,13 +2062,23 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 
 	atomic_set(&tsdev->streaming, 1);
 
-#if !defined(__FreeBSD__)
+#if defined(__FreeBSD__)
+	sx_xlock( &px4->xlock );
+#else
 	mutex_lock(&px4->lock);
 #endif
 
 	if (!px4->streaming_count) {
 		
 		dev_dbg(px4->dev, "px4_tsdev_start_streaming %d:%u: streaming_usb_buffer_size: %u\n", px4->dev_idx, tsdev->id, bus->usb.streaming_usb_buffer_size );
+
+#if 0
+		ret = it930x_purge_psb(&px4->it930x, 2000);  // timeout is ignored
+		if (ret) {
+			dev_err(px4->dev, "px4_tsdev_start_streaming %d:%u: it930x_purge_psb() failed. (ret: %d)\n", px4->dev_idx, tsdev->id, ret);
+			goto fail;
+		}
+#endif
 	}
 
 	switch (tsdev->isdb) {
@@ -1556,11 +2126,13 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 		usbd_transfer_start( bus->usb.stream_transfer[ IT930X_BUS_STREAM_RD ] );
 		mtx_unlock( &bus->usb.stream_mtx );
 	}
-
+	
 	px4->streaming_count++;
 	streaming_count = px4->streaming_count;
 
-#if !defined(__FreeBSD__)
+#if defined(__FreeBSD__)
+	sx_xunlock( &px4->xlock );
+#else
 	mutex_unlock(&px4->lock);
 #endif
 	
@@ -1570,7 +2142,9 @@ static int px4_tsdev_start_streaming(struct px4_tsdev *tsdev)
 fail_after_ringbuffer:
 	//	ringbuffer_stop(tsdev->ringbuf);
 fail:
-#if !defined(__FreeBSD__)
+#if defined(__FreeBSD__)
+	sx_xunlock( &px4->xlock );
+#else
 	mutex_unlock(&px4->lock);
 #endif
 	atomic_set(&tsdev->streaming, 0);
@@ -1612,16 +2186,18 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 	streaming_count = px4->streaming_count;
 
 #if defined(__FreeBSD__)
-	sx_xunlock( &px4->xlock);
+	if (!avail){
+		sx_xunlock( &px4->xlock);
+		return 0;
+	}
 #else
 	mutex_unlock(&px4->lock);
 
 	ringbuffer_stop(tsdev->ringbuf);
-#endif
 	
 	if (!avail)
 		return 0;
-
+#endif
 	switch (tsdev->isdb) {
 	case ISDB_S:
 		// disable ts pins
@@ -1637,6 +2213,9 @@ static int px4_tsdev_stop_streaming(struct px4_tsdev *tsdev, bool avail)
 		ret = -EIO;
 		break;
 	}
+#if defined(__FreeBSD__)
+	sx_xunlock( &px4->xlock);
+#endif
 
 	dev_dbg(px4->dev, "px4_tsdev_stop_streaming %d:%u: streaming_count: %u\n", px4->dev_idx, tsdev->id, streaming_count);
 
@@ -1835,9 +2414,9 @@ static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS)
 		return -EINVAL;
 	}
 	
-	sx_xlock( &tsdev->xlock);
+	//sx_xlock( &tsdev->xlock);
 	error= px4_tsdev_set_lnb_power(tsdev, b);
-	sx_xunlock(&tsdev->xlock);
+	//sx_xunlock(&tsdev->xlock);
 	if( error ){
 		dev_dbg(px4->dev, "px4_sysctl_lnb:error=%d\n", error);
 	}
@@ -1872,11 +2451,13 @@ static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS)
 	freq.slot = ((val >> 16)& 0xffff);
 
 #if defined(__FreeBSD__)
-	sx_xlock( &tsdev->xlock);
+	//sx_xlock( &tsdev->xlock );
+	//sx_xlock( &px4->xlock );
 #endif
 	error = px4_tsdev_set_channel( tsdev, &freq );
 #if defined(__FreeBSD__)
-	sx_xunlock(&tsdev->xlock);
+	//sx_xunlock( &px4->xlock );
+	//sx_xunlock(&tsdev->xlock );
 #endif
 	
 	return error;
@@ -1900,11 +2481,13 @@ static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS)
 	}
 
 #if defined(__FreeBSD__)
-	sx_xlock(&tsdev->xlock);
+	//sx_xlock( &tsdev->xlock );
+	//sx_xlock( &px4->xlock );
 #endif
 	error = px4_tsdev_get_cn(tsdev, (u32 *)&cn);
 #if defined(__FreeBSD__)
-	sx_xunlock(&tsdev->xlock);
+	//sx_xunlock( &px4->xlock );
+	//sx_xunlock(&tsdev->xlock );
 #endif
 	if( error ){
 		return error;
