@@ -2,14 +2,24 @@
 
 FreeNASで録画サーバーを運用したいためにPLEX PX-W3U4/Q3U4/W3PE4/Q3PE4用の非公式版Linuxドライバをfbsdpt3を参考にFreeBSDに移植してみました。  
 [非公式版Linuxドライバ](https://github.com/nns779/px4_drv)のv0.2.1a(90e0a4b30b812e7e5fff4483144f165de8914157)をベースにしています。  
-
 Kernel Panicが発生する可能性があります。  
-Freebsdのmtx(mutex)は,一定時間以上SleepしているととKernel Panic(Sleeping Thread)が発生するので、sx_xlockに置き換え。 
 
-1channelだとdropが発生しないけれど、2channel目の制御することでdropが発生している感じ。   
-continuty_counterをcheckすると、周波数を設定後や、他のchannelをclose時に不連続が発生する。   
-周波数設定後については、ts packetをdiscardすることで、回避できるが、他のchannelの制御信号が別のchannelに影響を与える理由が不明。   
-また、channelの制御をしていないTimingで、decode ngも発生することがある。(壊れた？) 
+Drop時、Syncが外れずに、TS Packetが連続的に消失していることから、usbd_transfer_submitが間に合っていないと推測。    
+FreebsdのUSB driverの構成では、
+callback関数内でDMA bufferの処理をしないと、次の転送ができないため、copyのみでcallback関数を終了し、別ThreadでTS Packetを処理するように変更しましたが、、、  
+PX-W3U4での結果は
+- Freebsd 13.0-Release CPU AMD FX-8800P 
+  - Dropする(数Drop/30minutes)
+- TrueNAS-13.0-U1.1(Freebsd 13.1-Release) CPU Pentium G4600
+  - Dropしていない(上記と比べると安定している)
+
+copyのみでsubmitが間に合わないのは、信じ難いが、残りのdeviceの制御等で、処理時間が遅延している可能性が高い(処理能力の可能性が高い)。  
+Freebsdは、DMAの構成上callbackがネックになり、linuxに比べて、CPUの処理能力が必要。  
+(CPU AMD FX-8800P+Linux非公式driverはDropしていない)  
+ext_bufferのoptionを利用してDMA bufferを切り替えれば、改善する可能はあるが、うまく動作していない。  
+TrueNAS Scaleとか、Dockerとか状況をみると、ext_bufferで動作させるモチベーションはないです。
+
+TrueNAS Coreのjail環境でdriverをcompile後、firmwareとdriverをホスト側にinstallして、jail環境のmirakurun+epgstation+mariadbで動作中  
 
 
 ## 対応デバイス
@@ -52,4 +62,4 @@ continuty_counterをcheckすると、周波数を設定後や、他のchannelを
 
 recpt1を使用してTSデータの受信ができます。  
 [努力したＷｉｋｉ](https://hgotoh.jp/wiki/doku.php/documents/freebsd/ptx/ptx-001)のrecpt1に、
-デバイスファイルを書き換えた[recpt1](https://github.com/kurosukelab/recpt1)が利用可能です。  
+デバイスファイルを書き換えた[recpt1](https://github.com/kurosukelab/recpt1) (branch fbsdpx4)が利用可能です。  
