@@ -20,7 +20,9 @@ ext_bufferのoptionを利用してDMA bufferを切り替えれば、改善する
 TrueNAS Scaleとか、Dockerとか状況をみると、ext_bufferで動作させるモチベーションはないです。
 
 TrueNAS Coreのjail環境でdriverをcompile後、firmwareとdriverをホスト側にinstallして、jail環境のmirakurun+epgstation+mariadbで動作中  
-
+- epgstationのdrop checkを有効にしてみたところ、ErrorとDropが発生していることある
+  - 録画終了後に、tsselectでdrop checkを実施するとerrorもdropも未発生。
+  - 同一時間、同一チャンネルの非公式linux版で録画したファイルにもnode-atibtsのsampleを利用して、drop checkをすると同じように検出しているので、driverの問題ではなさそう。
 
 ## 対応デバイス
 
