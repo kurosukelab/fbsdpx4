@@ -22,7 +22,9 @@ TrueNAS Scaleとか、Dockerとか状況をみると、ext_bufferで動作させ
 TrueNAS Coreのjail環境でdriverをcompile後、firmwareとdriverをホスト側にinstallして、jail環境のmirakurun+epgstation+mariadbで動作中  
 - epgstationのdrop checkを有効にしてみたところ、ErrorとDropが発生していることある
   - 録画終了後に、tsselectでdrop checkを実施するとerrorもdropも未発生。
-  - 同一時間、同一チャンネルの非公式linux版で録画したファイルにもnode-atibtsのsampleを利用して、drop checkをすると同じように検出しているので、driverの問題ではなさそう。
+  - 同一時間、同一チャンネルの非公式linux版で録画したファイルにもnode-aribtsのsampleを利用して、drop checkをすると同じように検出しているので、driverの問題ではなさそう。
+  - adaptation_field=2、discontinuity_indicator=1の次のts packet(同一pid)で、node-aribtsは、dropを検出する。
+    - tsselectでは上記の場合であってもcontinuity_counterを更新しているが、node-aribtsは、tsPacket.hasData()がtrue(adaptation_fieldの下位1bitが1)の場合のみ更新しており、実装が異なる
 
 ## 対応デバイス
 
