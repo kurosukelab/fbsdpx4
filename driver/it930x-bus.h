@@ -24,7 +24,7 @@ enum {
 };
 
 #define IT930X_BUS_TRANSFERRED (1)
-#define IT930X_BUS_BUF_SIZE (256)
+#define IT930X_BUS_CMD_BUF_SIZE (256)
 #define IT930X_BUS_CMD_MAX_BUFFERS (16)
 
 #else
@@ -38,7 +38,8 @@ typedef enum {
 } it930x_bus_type_t;
 
 #if defined(__FreeBSD__)
-typedef int (*it930x_bus_stream_handler_t)(void *context, struct usb_page_cache *pc, u32 len);
+typedef void (*it930x_bus_stream_buf_getter_t)(void *context, uint8_t **buf, uint32_t *len);
+typedef int  (*it930x_bus_stream_handler_t)(void *context, uint8_t *buf, u32 len);
 #else
 typedef int (*it930x_bus_stream_handler_t)(void *context, void *buf, u32 len);
 #endif
@@ -49,7 +50,11 @@ struct it930x_bus_operations {
 	int (*ctrl_tx)(struct it930x_bus *bus, const void *buf, int len, void *opt);
 	int (*ctrl_rx)(struct it930x_bus *bus, void *buf, int *len, void *opt);
 	int (*stream_rx)(struct it930x_bus *bus, void *buf, int *len, int timeout);
+#if defined(__FreeBSD__)
+	int (*start_streaming)(struct it930x_bus *bus, it930x_bus_stream_buf_getter_t stream_buf_getter, it930x_bus_stream_handler_t stream_handler, void *context);
+#else	
 	int (*start_streaming)(struct it930x_bus *bus, it930x_bus_stream_handler_t stream_handler, void *context);
+#endif
 	int (*stop_streaming)(struct it930x_bus *bus);
 };
 #if defined(__FreeBSD__)
@@ -57,7 +62,7 @@ struct it930x_bus_operations {
 struct it930x_bus_cmd_buf {
 	TAILQ_ENTRY(it930x_bus_cmd_buf) entry;
 	uint32_t len;
-	uint8_t buf[ IT930X_BUS_BUF_SIZE ];
+	uint8_t buf[ IT930X_BUS_CMD_BUF_SIZE ];
 };
 
 TAILQ_HEAD(it930x_bus_cmd_head, it930x_bus_cmd_buf);
@@ -82,8 +87,8 @@ struct it930x_bus {
 #endif
 			void *priv;
 #if defined(__FreeBSD__)
-			u32 streaming_usb_mbufs;
-			u32 streaming_usb_buffer_size;
+			u32 stream_usb_frames;
+			u32 stream_usb_bufsize;
 			uint8_t iface_num;
 			uint8_t iface_index;
 			struct usb_xfer *ctrl_transfer[IT930X_BUS_CTRL_N_TRANSFER];
@@ -133,6 +138,18 @@ static inline int it930x_bus_stream_rx(struct it930x_bus *bus, void *buf, int *l
 	return bus->ops.stream_rx(bus, buf, len, timeout);
 }
 
+#if defined(__FreeBSD__)
+static inline int it930x_bus_start_streaming(struct it930x_bus *bus,
+											 it930x_bus_stream_buf_getter_t stream_buf_getter,
+											 it930x_bus_stream_handler_t stream_handler,
+											 void *context)
+{
+	if (!bus || !bus->ops.start_streaming)
+		return -EINVAL;
+
+	return bus->ops.start_streaming(bus, stream_buf_getter, stream_handler, context);
+}
+#else
 static inline int it930x_bus_start_streaming(struct it930x_bus *bus, it930x_bus_stream_handler_t stream_handler, void *context)
 {
 	if (!bus || !bus->ops.start_streaming)
@@ -140,6 +157,7 @@ static inline int it930x_bus_start_streaming(struct it930x_bus *bus, it930x_bus_
 
 	return bus->ops.start_streaming(bus, stream_handler, context);
 }
+#endif
 
 static inline int it930x_bus_stop_streaming(struct it930x_bus *bus)
 {
