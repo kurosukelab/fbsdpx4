@@ -15,12 +15,8 @@
 enum {
 	IT930X_BUS_CTRL_WR,
 	IT930X_BUS_CTRL_RD,
-	IT930X_BUS_CTRL_N_TRANSFER
-};
-
-enum {
 	IT930X_BUS_STREAM_RD,
-	IT930X_BUS_STREAM_N_TRANSFER
+	IT930X_BUS_CTRL_N_TRANSFER
 };
 
 #define IT930X_BUS_TRANSFERRED (1)
@@ -91,8 +87,7 @@ struct it930x_bus {
 			u32 stream_usb_bufsize;
 			uint8_t iface_num;
 			uint8_t iface_index;
-			struct usb_xfer *ctrl_transfer[IT930X_BUS_CTRL_N_TRANSFER];
-			struct usb_xfer *stream_transfer[IT930X_BUS_STREAM_N_TRANSFER];
+			struct usb_xfer *transfer[IT930X_BUS_CTRL_N_TRANSFER];
 			uint8_t zero_length_packets;
 			uint8_t discard_packets;
 			struct it930x_bus_cmd_head xfer_tx_head;
