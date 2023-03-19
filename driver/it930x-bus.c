@@ -73,6 +73,7 @@ static struct usb_config it930x_config[ IT930X_BUS_CTRL_N_TRANSFER] = {
 		.callback = &it930x_usb_ctrl_tx_msg_callback,
 		.bufsize = IT930X_BUS_CMD_BUF_SIZE,
 		.flags = { .pipe_bof = 1 },
+		.timeout = 50, /* 50m second. */
 		.type = UE_BULK,
 		.endpoint = 0x02,
 		.direction = UE_DIR_OUT
@@ -81,6 +82,7 @@ static struct usb_config it930x_config[ IT930X_BUS_CTRL_N_TRANSFER] = {
 		.callback = &it930x_usb_ctrl_rx_msg_callback,
 		.bufsize = IT930X_BUS_CMD_BUF_SIZE,
 		.flags = { .short_xfer_ok = 1, .pipe_bof = 1 },
+		.timeout = 50, /* 50m second. */
 		.type = UE_BULK,
 		.endpoint = 0x81,
 		.direction = UE_DIR_IN
@@ -129,13 +131,12 @@ static struct it930x_bus_cmd_buf* it930x_bus_cmd_buf_alloc( struct it930x_bus *b
 void it930x_usb_ctrl_tx_msg_callback( struct usb_xfer *transfer, usb_error_t error )
 {
 	struct it930x_bus *bus = usbd_xfer_softc( transfer );
-	struct it930x_bus_cmd_head *phead = usbd_xfer_get_priv( transfer );
+	//struct it930x_bus_cmd_head *phead = usbd_xfer_get_priv( transfer );
 	struct it930x_bus_cmd_buf *cb;
 	struct usb_page_cache *pc;
 	
 	switch (USB_GET_STATE(transfer)) {
 	case USB_ST_TRANSFERRED:
-		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
 		bus->usb.event |= IT930X_BUS_TRANSFERRED;
 		break;
 	case USB_ST_SETUP:
@@ -143,7 +144,6 @@ void it930x_usb_ctrl_tx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 		cb = TAILQ_FIRST( &bus->usb.cmd_tx_buf_pending );
 		if(cb){
 			TAILQ_REMOVE( &bus->usb.cmd_tx_buf_pending, cb, entry );
-			TAILQ_INSERT_TAIL( phead, cb, entry );
 
 			pc = usbd_xfer_get_frame( transfer, 0);
 			usbd_copy_in( pc, 0, cb->buf, cb->len );
@@ -152,10 +152,10 @@ void it930x_usb_ctrl_tx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 			usbd_xfer_set_frames( transfer, 1 );
 			usbd_xfer_set_frame_data( transfer, 0, cb->buf, cb->len);
 			usbd_transfer_submit(transfer);
+			TAILQ_INSERT_TAIL( &bus->usb.cmd_buf_free, cb, entry );
 		}
 		break;
 	default:
-		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
 		if( error != USB_ERR_CANCELLED ) {
 			usbd_xfer_set_stall( transfer );
 			if(error){
@@ -172,9 +172,10 @@ void it930x_usb_ctrl_tx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 void it930x_usb_ctrl_rx_msg_callback( struct usb_xfer *transfer, usb_error_t error )
 {
 	struct it930x_bus *bus = usbd_xfer_softc( transfer );
-	struct it930x_bus_cmd_head *phead = usbd_xfer_get_priv( transfer );
+	struct usb_page_cache *pc;
 	struct it930x_bus_cmd_buf *cb;
 	int actual;
+	int len;
 	int max;
 	
 	usbd_xfer_status( transfer, &actual, NULL, NULL, NULL );
@@ -182,9 +183,23 @@ void it930x_usb_ctrl_rx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 	switch (USB_GET_STATE(transfer)) {
 	case USB_ST_TRANSFERRED:
 		if( actual > 0 ) {
-			TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
-			bus->usb.event |= IT930X_BUS_TRANSFERRED;
-			break;
+			cb = TAILQ_FIRST( &bus->usb.cmd_buf_free );
+			if( cb ){
+				pc = usbd_xfer_get_frame( transfer, 0 );
+				len= actual;
+				if( actual > IT930X_BUS_CMD_BUF_SIZE ){
+					len= IT930X_BUS_CMD_BUF_SIZE;
+				}
+				usbd_copy_out( pc, 0, cb->buf, len );
+				cb->len = len;
+				TAILQ_INSERT_TAIL( &bus->usb.cmd_rx_buf_pending, cb, entry );
+				
+				bus->usb.event |= IT930X_BUS_TRANSFERRED;
+				break;
+			}
+			else {
+				dev_dbg(bus->dev, "%s:no_cmd_buf\n", __FUNCTION__);
+			}
 		}
 		else {
 			dev_dbg(bus->dev, "%s:zero length\n", __FUNCTION__);
@@ -192,19 +207,12 @@ void it930x_usb_ctrl_rx_msg_callback( struct usb_xfer *transfer, usb_error_t err
 		//break;
 	case USB_ST_SETUP:
 	tr_setup:
-		cb = TAILQ_FIRST( &bus->usb.cmd_rx_buf_pending );
-		if(cb != NULL){
-			TAILQ_REMOVE( &bus->usb.cmd_rx_buf_pending, cb, entry );
-			TAILQ_INSERT_TAIL( phead, cb, entry );
-		}
-
 		max = usbd_xfer_max_len( transfer );
 		usbd_xfer_set_frame_len( transfer, 0, max );
 		usbd_transfer_submit(transfer);
 
 		return;
 	default:
-		TAILQ_CONCAT( &bus->usb.cmd_buf_free, phead, entry );
 		if( error != USB_ERR_CANCELLED ){
 			usbd_xfer_set_stall( transfer );
 			dev_err(bus->dev, "%s:rx error=%d\n", __FUNCTION__, error);
@@ -337,17 +345,13 @@ static int it930x_usb_ctrl_tx_msg(struct it930x_bus *bus, const void *buf, int l
 static int it930x_usb_ctrl_rx_msg(struct it930x_bus *bus, void *buf, int len, int *act_len, int timeout )
 {
 	struct usb_xfer *xfer;
-	struct usb_page_cache *pc;
 	struct it930x_bus_cmd_buf *cb;
 	int ret;
 	
 	xfer= bus->usb.transfer[ IT930X_BUS_CTRL_RD ];
-	cb = it930x_bus_cmd_buf_alloc( bus, M_WAITOK );
 
 	mtx_lock( &bus->usb.xfer_mtx );
 	
-	TAILQ_INSERT_TAIL( &bus->usb.cmd_rx_buf_pending, cb, entry );
-
 	usbd_xfer_set_timeout(xfer, timeout );
 	
 	usbd_transfer_start( xfer );
@@ -359,16 +363,16 @@ static int it930x_usb_ctrl_rx_msg(struct it930x_bus *bus, void *buf, int len, in
 
 	ret= xfer->error;
 	if( !ret ){
-		pc = usbd_xfer_get_frame( xfer, 0 );
-		*act_len = usbd_xfer_frame_len( xfer, 0 );
-		if(*act_len <= len ){
-			len= *act_len;
-		}
-		else {
+		cb= TAILQ_FIRST( &bus->usb.cmd_rx_buf_pending );
+		*act_len= cb->len;
+		if(*act_len > len ){
 			dev_dbg(bus->dev,"actual length=%d, len=%d\n", *act_len, len);
 			*act_len= len;
 		}
-		usbd_copy_out( pc, 0, buf, len );
+		memcpy(buf, cb->buf,  *act_len);
+		
+		TAILQ_INSERT_TAIL( &bus->usb.cmd_buf_free, cb, entry );
+		
 	}
 	else {
 		usbd_transfer_stop( xfer );

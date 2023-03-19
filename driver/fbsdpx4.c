@@ -1698,9 +1698,9 @@ static int px4_sysctl_lnb(SYSCTL_HANDLER_ARGS)
 		return -EINVAL;
 	}
 	
-	//sx_xlock( &tsdev->xlock);
+	sx_xlock( &tsdev->xlock);
 	error= px4_tsdev_set_lnb_power(tsdev, b);
-	//sx_xunlock(&tsdev->xlock);
+	sx_xunlock(&tsdev->xlock);
 	if( error ){
 		dev_dbg(px4->dev, "px4_sysctl_lnb:error=%d\n", error);
 	}
@@ -1735,13 +1735,13 @@ static int px4_sysctl_freq(SYSCTL_HANDLER_ARGS)
 	freq.slot = ((val >> 16)& 0xffff);
 
 #if defined(__FreeBSD__)
-	//sx_xlock( &tsdev->xlock );
+	sx_xlock( &tsdev->xlock );
 	//sx_xlock( &px4->xlock );
 #endif
 	error = px4_tsdev_set_channel( tsdev, &freq );
 #if defined(__FreeBSD__)
 	//sx_xunlock( &px4->xlock );
-	//sx_xunlock(&tsdev->xlock );
+	sx_xunlock(&tsdev->xlock );
 #endif
 	
 	return error;
@@ -1765,13 +1765,13 @@ static int px4_sysctl_signal(SYSCTL_HANDLER_ARGS)
 	}
 
 #if defined(__FreeBSD__)
-	//sx_xlock( &tsdev->xlock );
+	sx_xlock( &tsdev->xlock );
 	//sx_xlock( &px4->xlock );
 #endif
 	error = px4_tsdev_get_cn(tsdev, (u32 *)&cn);
 #if defined(__FreeBSD__)
 	//sx_xunlock( &px4->xlock );
-	//sx_xunlock(&tsdev->xlock );
+	sx_xunlock(&tsdev->xlock );
 #endif
 	if( error ){
 		return error;
@@ -1985,6 +1985,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 
 #if defined(__FreeBSD__)
 	
+/*
 	dev_dbg( px4->dev, "px4_tsdev_open:start_streaming\n" );
 
 	error = px4_tsdev_start_streaming( tsdev );
@@ -1992,7 +1993,7 @@ static int px4_tsdev_open(struct usb_fifo *fifo, int fflags)
 	if(error){
 		dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
 	}
-	
+*/	
 	sx_xunlock(&px4->xlock);
 	sx_xunlock(&tsdev->xlock);
 #else
@@ -2118,8 +2119,18 @@ static void px4_tsdev_start_read( struct usb_fifo *fifo )
 		dev_dbg(px4->dev, "px4_tsdev_start_read %d:%u:\n", px4->dev_idx, tsdev->id);
 		tsdev->discard_ts_packets = discard_ts_packets;
 	}
-	
 	atomic_set(&tsdev->ts_packet_read, 1 );
+	
+	sx_xlock( &tsdev->xlock );
+	{
+		int error;
+		dev_dbg( px4->dev, "px4_tsdev_open:start_streaming\n" );
+		error = px4_tsdev_start_streaming( tsdev );
+		if(error){
+			dev_dbg( px4->dev, "tsdev_id=%d error=%d", tsdev->id, error );
+		}
+	}
+	sx_xunlock( &tsdev->xlock );
 	
 	return;
 }
